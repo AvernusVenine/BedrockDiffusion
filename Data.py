@@ -3,18 +3,54 @@ import torch
 from pathlib import Path
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import Dataset
-from Noise import GaussianNoise
 
 class BedrockDataset(Dataset):
-    def __init__(self, data, context):
+    """
+    Dataset containing the subsurface rasters and the context to generate them.
+    Context takes the form of a (B x N x N x C) array where C corresponds with the following:
+        0: Elevation map
+    """
+    def __init__(self, data, context, scaler):
         self.data = data
         self.context = context
+        self.scaler = scaler
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        return self.data[idx], self.context[idx]
+        boreholes, existence = self.select_boreholes(idx)
+        return self.data[idx], self.context[idx], boreholes, existence
+
+    def select_boreholes(self, idx):
+        """
+        Selects (0-25) random points with a drilled depth based off a normal distribution
+        :param idx: Data index
+        :return: Known formation elevation tensor,
+                 Tensor signifying knowledge of a formations elevation
+        """
+        count = np.random.randint(low=0, high=26)
+
+        holes = torch.zeros((200, 200, self.data.shape[3]), dtype=torch.float32)
+        existence = torch.zeros((200, 200, self.data.shape[3]), dtype=torch.float32)
+
+        for _ in range(count):
+            x = np.random.randint(low=0, high=200)
+            y = np.random.randint(low=0, high=200)
+
+            z = np.random.randn() * 175.0 + 265.0
+            z = z / self.scaler.scale_[0]
+            z = self.context[idx, x, y, 0] - z
+
+            for jdx in range(self.data.shape[3]):
+
+                elevation = self.data[idx, x, y, jdx]
+
+                if elevation >= z:
+                    holes[x, y, jdx] = elevation
+                    existence[x, y, jdx] = 1.0
+
+        return holes, existence
 
 def load_rasters(path, undiff_prefix='cmts'):
     """
@@ -43,14 +79,15 @@ def create_data(rasters, elevation, count=100, size=200):
     :param elevation: Elevation raster numpy array
     :param count: Amount of data to generate
     :param size: Resolution of data to generate
-    :return: Data tensor, Scaler
+    :return: Data tensor,
+             Scaler
     """
 
     scaler = scaler_rasters(np.concatenate([rasters, [elevation]]))
     shape = rasters[0].shape
 
-    rasters = [scaler.transform(idx.reshape(-1, 1)).reshape(shape)[200:-1000, 200:-200] for idx in rasters]
-    elevation = scaler.transform(elevation.reshape(-1, 1)).reshape(shape)[200:-1000, 200:-200]
+    rasters = [scaler.transform(idx.reshape(-1, 1)).reshape(shape)[1000:-1000, 1000:-1000] for idx in rasters]
+    elevation = scaler.transform(elevation.reshape(-1, 1)).reshape(shape)[1000:-1000, 1000:-1000]
 
     data = []
 
