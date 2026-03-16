@@ -22,14 +22,19 @@ class BedrockDataset(Dataset):
         boreholes, existence = self.select_boreholes(idx)
         return self.data[idx], self.context[idx], boreholes, existence
 
-    def select_boreholes(self, idx):
+    def select_boreholes(self, idx, seed=None, count=None):
         """
         Selects (0-25) random points with a drilled depth based off a normal distribution
         :param idx: Data index
+        :param seed: Optional integer seed for numpy
         :return: Known formation elevation tensor,
                  Tensor signifying knowledge of a formations elevation
         """
-        count = np.random.randint(low=0, high=26)
+        if seed is not None:
+            np.random.seed(seed)
+
+        if count is None:
+            count = np.random.randint(low=0, high=26)
 
         holes = torch.zeros((200, 200, self.data.shape[3]), dtype=torch.float32)
         existence = torch.zeros((200, 200, self.data.shape[3]), dtype=torch.float32)
@@ -74,7 +79,7 @@ def load_rasters(path, undiff_prefix='cmts'):
 
 def create_data(rasters, elevation, count=100, size=200):
     """
-    Selects N random 200x200 pieces of land and compresses them into individual data pieces
+    Selects K random NxN pieces of land and compresses them into individual data pieces
     :param rasters: Rasters numpy array
     :param elevation: Elevation raster numpy array
     :param count: Amount of data to generate
@@ -83,7 +88,7 @@ def create_data(rasters, elevation, count=100, size=200):
              Scaler
     """
 
-    scaler = scaler_rasters(np.concatenate([rasters, [elevation]]))
+    scaler = scale_rasters(np.concatenate([rasters, [elevation]]))
     shape = rasters[0].shape
 
     rasters = [scaler.transform(idx.reshape(-1, 1)).reshape(shape)[1000:-1000, 1000:-1000] for idx in rasters]
@@ -110,7 +115,7 @@ def create_data(rasters, elevation, count=100, size=200):
 
     return data, scaler
 
-def scaler_rasters(rasters):
+def scale_rasters(rasters):
     """
     Helper function to scale rasters onto a normal scale
     :param rasters: Rasters tensor
@@ -120,3 +125,43 @@ def scaler_rasters(rasters):
     scaler.fit(rasters.reshape(-1, 1))
 
     return scaler
+
+def load_sample_area(path, count=25, seed=0):
+    """
+    Selects a random NxN area for model testing
+    :param path: Data path
+    :param count: Number of boreholes to randomly select
+    :param seed: Optional integer seed for numpy
+    :return: Geologist interpreted rasters,
+             Boreholes,
+             Elevation raster
+    """
+    rasters, elevation = load_rasters(path)
+
+    scaler = scale_rasters(np.concatenate([rasters, [elevation]]))
+    shape = rasters[0].shape
+
+    rasters = [scaler.transform(idx.reshape(-1, 1)).reshape(shape)[1000:-1000, 1000:-1000] for idx in rasters]
+    elevation = scaler.transform(elevation.reshape(-1, 1)).reshape(shape)[1000:-1000, 1000:-1000]
+
+    np.random.seed(seed)
+
+    x = np.random.randint(low=0, high=rasters[0].shape[0] - 200)
+    y = np.random.randint(low=0, high=rasters[0].shape[1] - 200)
+
+    arr = np.full((200, 200, len(rasters)), np.nan)
+
+    for idx in range(len(rasters)):
+        arr[:, :, idx] = rasters[idx][x:x+200, y:y+200]
+
+    holes = np.zeros((200, 200, len(rasters)))
+    existence = np.zeros((200, 200, len(rasters)))
+
+    for _ in range(count):
+        x = np.random.randint(low=0, high=200)
+        y = np.random.randint(low=0, high=200)
+
+        z = np.random.randn() * 175.0 + 265.0
+        z = z / scaler.scale_[0]
+
+    return arr,

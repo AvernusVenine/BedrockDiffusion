@@ -34,7 +34,7 @@ def train_model(data_path, save_path, max_epochs=15, lr=1e-3):
     rasters, elevation = Data.load_rasters(data_path)
     data, scaler = Data.create_data(rasters, elevation, count=1000)
 
-    data = sanitise_input(data)
+    data = sanitise_input(data[:, :, :, :len(rasters)])
 
     dataset = BedrockDataset(data[:, :, :, :len(rasters)], data[:, :, :, len(rasters):], scaler)
 
@@ -74,6 +74,7 @@ def train_model(data_path, save_path, max_epochs=15, lr=1e-3):
         attention_head_dim=8,
         norm_num_groups=32,
     ).to(device)
+    model.enable_gradient_checkpointing()
     model = torch.compile(model)
 
     scheduler = DDPMScheduler(num_train_timesteps=1000, beta_schedule='squaredcos_cap_v2')
@@ -184,3 +185,54 @@ def train_model(data_path, save_path, max_epochs=15, lr=1e-3):
                 },
                 f'{save_path}_epoch{epoch + 1:0d}.mdl'
             )
+
+def get_random_sample(data_path):
+    rasters, elevation = Data.load_rasters(data_path)
+    data, scaler = Data.create_data(rasters, elevation, count=1)
+
+    data = sanitise_input(data)
+
+    dataset = BedrockDataset(data[:, :, :, :len(rasters)], data[:, :, :, len(rasters):], scaler)
+
+    return data
+
+def generate(data, model_path, save_path, seed=0):
+    model_dict = torch.load(model_path, map_location='cpu')
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    model = UNet2DConditionModel(
+        sample_size=200,
+        in_channels=model_dict['n_formations'],
+        out_channels=model_dict['n_formations'],
+        cross_attention_dim=512,
+        down_block_types=(
+            'CrossAttnDownBlock2D',
+            'CrossAttnDownBlock2D',
+            'DownBlock2D',
+        ),
+        up_block_types=(
+            'UpBlock2D',
+            'CrossAttnUpBlock2D',
+            'CrossAttnUpBlock2D',
+        ),
+        block_out_channels=(128, 256, 512),
+        layers_per_block=2,
+        attention_head_dim=8,
+        norm_num_groups=32,
+    ).to(device)
+    model.load_state_dict(model_dict['model'])
+
+    context_encoder = ContextEncoder(
+        in_channels=2*model_dict['n_formations'] + 1,
+        cross_attention_dim=512,
+        seq_len=64,
+    ).to(device)
+    context_encoder.load_state_dict(model_dict['context_encoder'])
+
+    torch.manual_seed(seed)
+    noise = torch.randn((model_dict['n_formations'], 200, 200), device=device)
+
+    for t in range(1001):
+
+        pass
