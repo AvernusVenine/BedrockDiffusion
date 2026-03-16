@@ -1,10 +1,9 @@
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor
 from torch.utils.data import random_split, DataLoader
 from diffusers import UNet2DConditionModel, DDPMScheduler
+import pandas as pd
 import Data
 from Data import BedrockDataset
 from ContextEncoder import ContextEncoder
@@ -24,6 +23,14 @@ def sanitise_input(data):
     return torch.from_numpy(data)
 
 def train_model(data_path, save_path, max_epochs=15, lr=1e-3):
+    """
+    Trains the diffusion model
+    :param data_path: Data path
+    :param save_path: Save path
+    :param max_epochs: Maximum number of epochs to train
+    :param lr: Initial learning rate
+    :return: 
+    """
     rasters, elevation = Data.load_rasters(data_path)
     data, scaler = Data.create_data(rasters, elevation, count=1000)
 
@@ -45,6 +52,7 @@ def train_model(data_path, save_path, max_epochs=15, lr=1e-3):
         cross_attention_dim=512,
         seq_len=64,
     ).to(device)
+    context_encoder = torch.compile(context_encoder)
 
     model = UNet2DConditionModel(
         sample_size=200,
@@ -66,7 +74,7 @@ def train_model(data_path, save_path, max_epochs=15, lr=1e-3):
         attention_head_dim=8,
         norm_num_groups=32,
     ).to(device)
-    model.enable_gradient_checkpointing()
+    model = torch.compile(model)
 
     scheduler = DDPMScheduler(num_train_timesteps=1000, beta_schedule='squaredcos_cap_v2')
 
@@ -77,6 +85,8 @@ def train_model(data_path, save_path, max_epochs=15, lr=1e-3):
     )
 
     best_loss = np.inf
+
+    loss_dict = {'train': [], 'test': []}
 
     for epoch in range(max_epochs):
         print(f'Epoch {epoch+1}')
@@ -91,17 +101,18 @@ def train_model(data_path, save_path, max_epochs=15, lr=1e-3):
             boreholes = boreholes.permute(0, 3, 1, 2).to(device)
             existence = existence.permute(0, 3, 1, 2).to(device)
 
-            context_input = torch.cat([context, boreholes, existence], dim=1)
-            encoder_hidden_states = context_encoder(context_input)
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                context_input = torch.cat([context, boreholes, existence], dim=1)
+                encoder_hidden_states = context_encoder(context_input)
 
-            noise = torch.randn(data.shape, device=device)
-            timesteps = torch.randint(0, 1000, (data.shape[0], ), device=device, dtype=torch.long)
+                noise = torch.randn(data.shape, device=device)
+                timesteps = torch.randint(0, 1000, (data.shape[0], ), device=device, dtype=torch.long)
 
-            data_t = scheduler.add_noise(data, noise, timesteps)
+                data_t = scheduler.add_noise(data, noise, timesteps)
 
-            predicted_noise = model(data_t, timesteps, encoder_hidden_states=encoder_hidden_states).sample
+                predicted_noise = model(data_t, timesteps, encoder_hidden_states=encoder_hidden_states).sample
 
-            loss = F.mse_loss(predicted_noise, noise)
+                loss = F.mse_loss(predicted_noise, noise)
 
             optimizer.zero_grad()
             loss.backward()
@@ -110,6 +121,7 @@ def train_model(data_path, save_path, max_epochs=15, lr=1e-3):
             train_loss += loss.item()
 
         print(f'Train Loss: {train_loss / len(train_loader)}')
+        loss_dict['train'].append(train_loss / len(train_loader))
 
         model.eval()
         context_encoder.eval()
@@ -123,19 +135,27 @@ def train_model(data_path, save_path, max_epochs=15, lr=1e-3):
                 boreholes = boreholes.permute(0, 3, 1, 2).to(device)
                 existence = existence.permute(0, 3, 1, 2).to(device)
 
-                context_input = torch.cat([context, boreholes, existence], dim=1)
-                encoder_hidden_states = context_encoder(context_input)
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    context_input = torch.cat([context, boreholes, existence], dim=1)
+                    encoder_hidden_states = context_encoder(context_input)
 
-                noise = torch.randn(data.shape, device=device)
-                timesteps = torch.randint(0, 1000, (data.shape[0],), device=device, dtype=torch.long)
+                    noise = torch.randn(data.shape, device=device)
+                    timesteps = torch.randint(0, 1000, (data.shape[0],), device=device, dtype=torch.long)
 
-                data_t = scheduler.add_noise(data, noise, timesteps)
+                    data_t = scheduler.add_noise(data, noise, timesteps)
 
-                predicted_noise = model(data_t, timesteps, encoder_hidden_states=encoder_hidden_states).sample
+                    predicted_noise = model(data_t, timesteps, encoder_hidden_states=encoder_hidden_states).sample
 
-                test_loss += F.mse_loss(predicted_noise, noise)
+                    loss = F.mse_loss(predicted_noise, noise)
 
-        print(f'Test Loss: {test_loss / len(test_loader)}')
+                test_loss += loss.item()
+
+        test_loss = test_loss / len(test_loader)
+
+        print(f'Test Loss: {test_loss}')
+        loss_dict['test'].append(test_loss)
+
+        pd.DataFrame(loss_dict).to_csv(f'{save_path}_loss.csv')
 
         if test_loss < best_loss:
             best_loss = test_loss
@@ -149,5 +169,18 @@ def train_model(data_path, save_path, max_epochs=15, lr=1e-3):
                     'loss': best_loss,
                     'n_formations': len(rasters),
                 },
-                save_path
+                f'{save_path}.mdl'
+            )
+
+        if (epoch + 1) % 5 == 0:
+            torch.save(
+                {
+                    'epoch': epoch + 1,
+                    'model': model.state_dict(),
+                    'context_encoder': context_encoder.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'loss': test_loss,
+                    'n_formations': len(rasters),
+                },
+                f'{save_path}_epoch{epoch + 1:0d}.mdl'
             )

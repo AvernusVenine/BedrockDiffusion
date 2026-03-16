@@ -111,6 +111,11 @@ def create_data(rasters, elevation, count=100, size=200):
     return data, scaler
 
 def scaler_rasters(rasters):
+    """
+    Helper function to scale rasters onto a normal scale
+    :param rasters: Rasters tensor
+    :return: Scaler
+    """
     scaler = StandardScaler()
     scaler.fit(rasters.reshape(-1, 1))
 

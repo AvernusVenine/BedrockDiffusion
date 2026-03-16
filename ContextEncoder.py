@@ -1,7 +1,9 @@
 import torch.nn as nn
 
 class ContextEncoder(nn.Module):
-
+    """
+    Encodes the context (elevation, boreholes, geophysical, etc) into a latent space for use in cross attention
+    """
     def __init__(self, in_channels, cross_attention_dim=512, seq_len=64):
         super().__init__()
 
