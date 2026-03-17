@@ -2,11 +2,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import random_split, DataLoader
-from diffusers import UNet2DConditionModel, DDPMScheduler
+from diffusers import UNet2DConditionModel, DDPMScheduler, DDIMScheduler
 import pandas as pd
 import Data
 from Data import BedrockDataset
 from ContextEncoder import ContextEncoder
+import joblib
 
 def sanitise_input(data):
     """
@@ -34,7 +35,7 @@ def train_model(data_path, save_path, max_epochs=15, lr=1e-3):
     rasters, elevation = Data.load_rasters(data_path)
     data, scaler = Data.create_data(rasters, elevation, count=1000)
 
-    data = sanitise_input(data[:, :, :, :len(rasters)])
+    data[:, :, :, :len(rasters)] = sanitise_input(data[:, :, :, :len(rasters)])
 
     dataset = BedrockDataset(data[:, :, :, :len(rasters)], data[:, :, :, len(rasters):], scaler)
 
@@ -164,8 +165,8 @@ def train_model(data_path, save_path, max_epochs=15, lr=1e-3):
             torch.save(
                 {
                     'epoch': epoch+1,
-                    'model': model.state_dict(),
-                    'context_encoder': context_encoder.state_dict(),
+                    'model': model._orig_mod.state_dict(),
+                    'context_encoder': context_encoder._orig_mod.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'loss': best_loss,
                     'n_formations': len(rasters),
@@ -177,8 +178,8 @@ def train_model(data_path, save_path, max_epochs=15, lr=1e-3):
             torch.save(
                 {
                     'epoch': epoch + 1,
-                    'model': model.state_dict(),
-                    'context_encoder': context_encoder.state_dict(),
+                    'model': model._orig_mod.state_dict(),
+                    'context_encoder': context_encoder._orig_mod.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'loss': test_loss,
                     'n_formations': len(rasters),
@@ -190,16 +191,25 @@ def get_random_sample(data_path):
     rasters, elevation = Data.load_rasters(data_path)
     data, scaler = Data.create_data(rasters, elevation, count=1)
 
-    data = sanitise_input(data)
+    data[:, :, :, :len(rasters)] = sanitise_input(data[:, :, :, :len(rasters)])
 
     dataset = BedrockDataset(data[:, :, :, :len(rasters)], data[:, :, :, len(rasters):], scaler)
 
-    return data
+    return dataset[0]
 
-def generate(data, model_path, save_path, seed=0):
+def generate(data, model_path, scaler_path, save_path, num_steps=100, seed=0):
+    elevation = data[1]
+    boreholes = data[2]
+    existence = data[3]
+
     model_dict = torch.load(model_path, map_location='cpu')
+    scaler = joblib.load(scaler_path)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    #TODO: Swap back to CUDA on higher end hardware
+    device = torch.device('cpu')
+
+    state_dict = model_dict['model']
+    state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
 
     model = UNet2DConditionModel(
         sample_size=200,
@@ -221,18 +231,55 @@ def generate(data, model_path, save_path, seed=0):
         attention_head_dim=8,
         norm_num_groups=32,
     ).to(device)
-    model.load_state_dict(model_dict['model'])
+    model.load_state_dict(state_dict)
+    model.eval()
+
+    state_dict = model_dict['context_encoder']
+    state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
 
     context_encoder = ContextEncoder(
         in_channels=2*model_dict['n_formations'] + 1,
         cross_attention_dim=512,
         seq_len=64,
     ).to(device)
-    context_encoder.load_state_dict(model_dict['context_encoder'])
+    context_encoder.load_state_dict(state_dict)
+    context_encoder.eval()
 
-    torch.manual_seed(seed)
-    noise = torch.randn((model_dict['n_formations'], 200, 200), device=device)
+    elevation = elevation.permute(2, 0, 1).unsqueeze(0).to(device)
+    boreholes = boreholes.permute(2, 0, 1).unsqueeze(0).to(device)
+    existence = existence.permute(2, 0, 1).unsqueeze(0).to(device)
 
-    for t in range(1001):
+    context_input = torch.cat([elevation, boreholes, existence], dim=1)
 
-        pass
+    with torch.no_grad():
+        encoder_hidden_states = context_encoder(context_input)
+
+        scheduler = DDIMScheduler(num_train_timesteps=1000, beta_schedule='squaredcos_cap_v2')
+        scheduler.set_timesteps(num_steps)
+
+        torch.manual_seed(seed)
+        sample = torch.randn((1, model_dict['n_formations'], 200, 200), device=device)
+
+        idx = 0
+        for t in scheduler.timesteps:
+            t_batch = t.unsqueeze(0).to(device)
+
+            if device.type == 'cuda':
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                    predicted_noise = model(sample, t_batch, encoder_hidden_states=encoder_hidden_states).sample
+            else:
+                predicted_noise = model(sample, t_batch, encoder_hidden_states=encoder_hidden_states).sample
+
+            sample = scheduler.step(predicted_noise, t, sample).prev_sample
+
+            idx += 1
+            print(f'Step {idx}')
+
+    generated = sample.squeeze(0).cpu().numpy()
+
+    C, H, W = generated.shape
+    generated = scaler.inverse_transform(generated.reshape(-1, 1)).reshape(C, H, W)
+
+    np.save(save_path, generated)
+
+    return generated

@@ -27,6 +27,7 @@ class BedrockDataset(Dataset):
         Selects (0-25) random points with a drilled depth based off a normal distribution
         :param idx: Data index
         :param seed: Optional integer seed for numpy
+        :param count: Optional borehole count rather than randomizing it
         :return: Known formation elevation tensor,
                  Tensor signifying knowledge of a formations elevation
         """
