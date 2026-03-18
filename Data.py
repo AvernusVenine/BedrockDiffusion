@@ -24,27 +24,26 @@ class BedrockDataset(Dataset):
 
     def select_boreholes(self, idx, seed=None, count=None):
         """
-        Selects (0-25) random points with a drilled depth based off a normal distribution
+        Selects (0-300) random points with a drilled depth based off a normal distribution
         :param idx: Data index
         :param seed: Optional integer seed for numpy
         :param count: Optional borehole count rather than randomizing it
         :return: Known formation elevation tensor,
                  Tensor signifying knowledge of a formations elevation
         """
-        if seed is not None:
-            np.random.seed(seed)
+        rng = np.random.default_rng(seed)
 
         if count is None:
-            count = np.random.randint(low=0, high=26)
+            count = rng.integers(0, 301)
 
         holes = torch.zeros((200, 200, self.data.shape[3]), dtype=torch.float32)
         existence = torch.zeros((200, 200, self.data.shape[3]), dtype=torch.float32)
 
         for _ in range(count):
-            x = np.random.randint(low=0, high=200)
-            y = np.random.randint(low=0, high=200)
+            x = rng.integers(0, 200)
+            y = rng.integers(0, 200)
 
-            z = np.random.randn() * 175.0 + 265.0
+            z = rng.standard_normal() * 175.0 + 265.0
             z = z / self.scaler.scale_[0]
             z = self.context[idx, x, y, 0] - z
 
@@ -68,6 +67,8 @@ def load_rasters(path, undiff_prefix='cmts'):
     path = Path(path).resolve()
 
     files = [f for f in path.glob(f'**/*_top.npy') if f.is_file()]
+    #TODO: Upon retraining the model swap the above line to the sorted iteration
+    #files = sorted(f for f in path.glob('**/*_top.npy') if f.is_file())
 
     rasters = [np.load(f) for f in files]
     undiff = np.load(f'{path}/{undiff_prefix}_base.npy')
