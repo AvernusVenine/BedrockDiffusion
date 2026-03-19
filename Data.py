@@ -10,17 +10,18 @@ class BedrockDataset(Dataset):
     Context takes the form of a (B x N x N x C) array where C corresponds with the following:
         0: Elevation map
     """
-    def __init__(self, data, context, scaler):
+    def __init__(self, data, context, existence, scaler):
         self.data = data
         self.context = context
+        self.existence = existence
         self.scaler = scaler
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        boreholes, existence = self.select_boreholes(idx)
-        return self.data[idx], self.context[idx], boreholes, existence
+        boreholes, bh_existence = self.select_boreholes(idx)
+        return self.data[idx], self.context[idx], self.existence[idx], boreholes, bh_existence
 
     def select_boreholes(self, idx, seed=None, count=None):
         """
@@ -57,24 +58,16 @@ class BedrockDataset(Dataset):
 
         return holes, existence
 
-def load_rasters(path, undiff_prefix='cmts'):
+def load_rasters(path):
     """
     Loads all rasters stored as numpy arrays at a given path
     :param path: Data path
-    :param undiff_prefix: Formation that borders very old undifferentiated bedrock
     :return: List of formation elevation rasters as numpy arrays, Elevation raster as a numpy array
     """
-    path = Path(path).resolve()
+    order = ['omaq', 'odub', 'ogsv', 'ogpr', 'ogcm', 'odcr', 'opgw', 'ostp', 'opsh', 'opod', 'cjdn', 'cstl', 'ctcg',
+             'cwoc', 'cecr', 'cmts', 'undiff']
 
-    files = [f for f in path.glob(f'**/*_top.npy') if f.is_file()]
-    #TODO: Upon retraining the model swap the above line to the sorted iteration
-    #files = sorted(f for f in path.glob('**/*_top.npy') if f.is_file())
-
-    rasters = [np.load(f) for f in files]
-    undiff = np.load(f'{path}/{undiff_prefix}_base.npy')
-
-    rasters.append(undiff)
-
+    rasters = [np.load(f'{path}/{idx}_top.npy') for idx in order]
     elevation = np.load(f'{path}/elevation.npy')
 
     return rasters, elevation
@@ -89,6 +82,7 @@ def create_data(rasters, elevation, count=100, size=200):
     :return: Data tensor,
              Scaler
     """
+    rng = np.random.default_rng()
 
     scaler = scale_rasters(np.concatenate([rasters, [elevation]]))
     shape = rasters[0].shape
@@ -99,8 +93,8 @@ def create_data(rasters, elevation, count=100, size=200):
     data = []
 
     for _ in range(count):
-        x = np.random.randint(low=0, high=rasters[0].shape[0] - size)
-        y = np.random.randint(low=0, high=rasters[0].shape[1] - size)
+        x = rng.integers(0, rasters[0].shape[0] - size)
+        y = rng.integers(0, rasters[0].shape[1] - size)
 
         arr = np.full((size, size, len(rasters) + 1), np.nan)
 
@@ -127,43 +121,3 @@ def scale_rasters(rasters):
     scaler.fit(rasters.reshape(-1, 1))
 
     return scaler
-
-def load_sample_area(path, count=25, seed=0):
-    """
-    Selects a random NxN area for model testing
-    :param path: Data path
-    :param count: Number of boreholes to randomly select
-    :param seed: Optional integer seed for numpy
-    :return: Geologist interpreted rasters,
-             Boreholes,
-             Elevation raster
-    """
-    rasters, elevation = load_rasters(path)
-
-    scaler = scale_rasters(np.concatenate([rasters, [elevation]]))
-    shape = rasters[0].shape
-
-    rasters = [scaler.transform(idx.reshape(-1, 1)).reshape(shape)[1000:-1000, 1000:-1000] for idx in rasters]
-    elevation = scaler.transform(elevation.reshape(-1, 1)).reshape(shape)[1000:-1000, 1000:-1000]
-
-    np.random.seed(seed)
-
-    x = np.random.randint(low=0, high=rasters[0].shape[0] - 200)
-    y = np.random.randint(low=0, high=rasters[0].shape[1] - 200)
-
-    arr = np.full((200, 200, len(rasters)), np.nan)
-
-    for idx in range(len(rasters)):
-        arr[:, :, idx] = rasters[idx][x:x+200, y:y+200]
-
-    holes = np.zeros((200, 200, len(rasters)))
-    existence = np.zeros((200, 200, len(rasters)))
-
-    for _ in range(count):
-        x = np.random.randint(low=0, high=200)
-        y = np.random.randint(low=0, high=200)
-
-        z = np.random.randn() * 175.0 + 265.0
-        z = z / scaler.scale_[0]
-
-    return arr,

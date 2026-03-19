@@ -30,9 +30,9 @@ def get_random_sample(data_path):
     rasters, elevation = Data.load_rasters(data_path)
     data, scaler = Data.create_data(rasters, elevation, count=1)
 
-    data[:, :, :, :len(rasters)] = DiffusionModel.sanitise_input(data[:, :, :, :len(rasters)])
+    data[:, :, :, :len(rasters)], existence = DiffusionModel.sanitise_input(data[:, :, :, :len(rasters)])
 
-    dataset = BedrockDataset(data[:, :, :, :len(rasters)], data[:, :, :, len(rasters):], scaler)
+    dataset = BedrockDataset(data[:, :, :, :len(rasters)], data[:, :, :, len(rasters):], existence, scaler)
 
     return dataset
 
@@ -51,6 +51,7 @@ def generate(dataset, model_path, scaler_path, save_path, num_steps=100, seed=0,
     data = dataset[0]
 
     elevation = data[1]
+    existence = data
     boreholes, existence = dataset.select_boreholes(0, count=count)
 
     model_dict = torch.load(model_path, map_location='cpu')
@@ -141,23 +142,19 @@ def sanitise_rasters(data):
     :param data: Raster data
     :return: Sanitised rasters
     """
-    order = [12, 8, 11, 10, 9, 7, 13, 16, 15, 14, 1, 4, 5, 6, 0, 2, 3]
     epsilon = 5.0
 
     data = data.copy()
 
-    for idx in range(len(order) - 1):
-        upper = order[idx]
-        lower = order[idx+1]
-
-        thickness = data[upper] - data[lower]
+    for idx in range(data.shape[0] - 1):
+        thickness = data[idx] - data[idx+1]
         existence = thickness <= epsilon
 
-        data[upper, existence] = np.nan
+        data[idx, existence] = np.nan
 
     return data
 
-def plot_rasters(output_path, data_path, elevation_path, borehole_path, scaler_path):
+def plot_rasters(output_path, data_path, elevation_path, borehole_path, scaler_path, save_path):
     """
     Plots rasters to compare model outputs and ground truth
     :param output_path: Model output path
@@ -165,6 +162,7 @@ def plot_rasters(output_path, data_path, elevation_path, borehole_path, scaler_p
     :param elevation_path: Elevation path
     :param borehole_path: Borehole path
     :param scaler_path: Scaler path
+    :param save_path: Save path
     :return:
     """
     output = np.load(output_path) #(num_formation x 200 x 200)
@@ -177,57 +175,54 @@ def plot_rasters(output_path, data_path, elevation_path, borehole_path, scaler_p
     data = np.transpose(data, (2, 0, 1))
     C, H, W = data.shape
     data = scaler.inverse_transform(data.reshape(-1, 1)).reshape(C, H, W)
-
-    boreholes = np.transpose(boreholes, (2, 0, 1))
-    C, H, W = boreholes.shape
-    boreholes = scaler.inverse_transform(boreholes.reshape(-1, 1)).reshape(C, H, W)
+    data = sanitise_rasters(data)
 
     boreholes = boreholes.astype(float)
     boreholes[boreholes == 0] = np.nan
+    boreholes = np.transpose(boreholes, (2, 0, 1))
+    C, H, W = boreholes.shape
+
+    flat = boreholes.reshape(-1, 1)
+    mask = ~np.isnan(flat[:, 0])
+    flat[mask] = scaler.inverse_transform(flat[mask].reshape(-1, 1))
+    boreholes = flat.reshape(C, H, W)
 
     output = sanitise_rasters(output)
 
     bh_cmap = plt.get_cmap('viridis').copy()
     bh_cmap.set_bad(color='white')
 
-    fig, axes = plt.subplots(
-        output.shape[0] + 1,
-        3,
-        figsize=(12, (output.shape[0] + 1) * 3),
-        constrained_layout=True,
-    )
-
-    col_titles = ['Predicted', 'Truth', 'Boreholes']
-    for col, title in enumerate(col_titles):
-        axes[0, col].set_title(title, pad=8)
-
     for f in range(output.shape[0]):
         vmin = min(np.nanmin(output[f]), np.nanmin(data[f]))
         vmax = max(np.nanmax(output[f]), np.nanmax(data[f]))
 
-        im = axes[f, 0].imshow(output[f], cmap='viridis', vmin=vmin, vmax=vmax, origin='upper')
-        fig.colorbar(im, ax=axes[f, 0], fraction=0.046, pad=0.04)
+        fig, axes = plt.subplots(1, 3, figsize=(12, 4), constrained_layout=True)
 
-        im = axes[f, 1].imshow(data[f], cmap='viridis', vmin=vmin, vmax=vmax, origin='upper')
-        fig.colorbar(im, ax=axes[f, 1], fraction=0.046, pad=0.04)
+        for ax, title in zip(axes, ['Predicted', 'Truth', 'Boreholes']):
+            ax.set_title(title)
+            ax.set_xticks([])
+            ax.set_yticks([])
 
-        im = axes[f, 2].imshow(boreholes[f], cmap='viridis', vmin=vmin, vmax=vmax, origin='upper')
-        fig.colorbar(im, ax=axes[f, 2], fraction=0.046, pad=0.04)
+        im = axes[0].imshow(output[f], cmap='viridis', vmin=vmin, vmax=vmax, origin='upper')
+        fig.colorbar(im, ax=axes[0], fraction=0.046, pad=0.04)
 
-        for col in range(3):
-            axes[f, col].set_xticks([])
-            axes[f, col].set_yticks([])
+        im = axes[1].imshow(data[f], cmap='viridis', vmin=vmin, vmax=vmax, origin='upper')
+        fig.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04)
 
-    elev_row = output.shape[0]
+        im = axes[2].imshow(boreholes[f], cmap=bh_cmap, vmin=vmin, vmax=vmax, origin='upper')
+        fig.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04)
 
-    for col in range(3):
-        axes[elev_row, col].set_visible(False)
+        fig.savefig(f'{save_path}_formation_{f}.png', dpi=150, bbox_inches='tight')
+        plt.close(fig)
 
-    elev_ax = fig.add_subplot(output.shape[0] + 1, 1, output.shape[0] + 1)
-    im = elev_ax.imshow(elevation, cmap='terrain', origin='upper')
-    fig.colorbar(im, ax=elev_ax, fraction=0.015, pad=0.04)
-    elev_ax.set_title('Surface Elevation', fontsize=11)
-    elev_ax.set_xticks([])
-    elev_ax.set_yticks([])
+    elevation = elevation.squeeze()
 
-    plt.show()
+    fig, ax = plt.subplots(1, 1, figsize=(5, 5), constrained_layout=True)
+    im = ax.imshow(elevation, cmap='terrain', origin='upper')
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_title('Surface Elevation', fontsize=12)
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    fig.savefig(f'{save_path}_elevation.png', dpi=150, bbox_inches='tight')
+    plt.close(fig)
