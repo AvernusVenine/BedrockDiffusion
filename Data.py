@@ -4,17 +4,14 @@ from pathlib import Path
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
+from construction.FormationInfo import FORMATION_ENCODINGS
+
+MAX_FORMATIONS = 17
 
 class BedrockDataset(Dataset):
     """
     Dataset containing the subsurface rasters and the context to generate them
     """
-
-    FORMATION_KEYS = ['omaq', 'odub', 'ogsv', 'ogpr', 'ogcm', 'odcr', 'opgw', 'ostp',
-                      'opsh', 'opod', 'cjdn', 'cstl', 'ctcg', 'cwoc', 'cecr', 'cmts', 'undiff']
-
-    CONTEXT_KEYS = ['elevation', 'magnetic', 'magnetic_1st', 'magnetic_2nd',
-                    'magnetic_tilt', 'gravity', 'gravity_2nd']
 
     def __init__(self, data, context, scaler_dict, size):
         self.data = data
@@ -27,18 +24,24 @@ class BedrockDataset(Dataset):
 
     def __getitem__(self, idx):
         rasters = torch.stack(
-            [torch.tensor(self.data[idx][k][1], dtype=torch.float32) for k in self.FORMATION_KEYS]
+            [torch.tensor(self.data[idx][k][1], dtype=torch.float32) for k in self.data[idx].keys()]
         )
 
-        boreholes = self.select_boreholes(idx)
+        existence = torch.stack(
+            [torch.tensor(self.data[idx][k][0], dtype=torch.float32) for k in self.data[idx].keys()]
+        )
+
+        boreholes, quaternary = self.select_boreholes(idx)
 
         context = torch.stack(
-            [torch.tensor(self.context[idx][k], dtype=torch.float32) for k in self.CONTEXT_KEYS]
+            [torch.tensor(self.context[idx][k], dtype=torch.float32) for k in self.context[idx].keys()]
         )
 
-        formation_info = None
+        formation_info = torch.stack(
+            [FORMATION_ENCODINGS[k] for k in self.data[idx].keys()]
+        )
 
-        return rasters, context, boreholes, formation_info
+        return rasters, existence, context, boreholes, formation_info, quaternary
 
     def select_boreholes(self, idx, seed=None, count=None):
         """
@@ -58,6 +61,7 @@ class BedrockDataset(Dataset):
             count = rng.integers(0, 301)
 
         out = torch.zeros((n_formations, 4, self.size, self.size), dtype=torch.float32)
+        quat_out = torch.zeros((4, self.size, self.size), dtype=torch.float32)
 
         elevation_scaler = self.scaler_dict['elevation']
 
@@ -70,17 +74,27 @@ class BedrockDataset(Dataset):
 
             z = self.context[idx]['elevation'][x, y] - z
 
+            # Mark quaternary borehole existence and top elevation reading
+            quat_out[0, x, y] = float(self.context[idx]['elevation'][x, y])
+            quat_out[2, x, y] = 1.0
+            quat_out[3, x, y] = 1.0
+
+            shallowest_top = None
+
             for jdx, k in enumerate(formation_keys):
                 # Mark borehole existence
                 out[jdx, 3, x, y] = 1.0
 
-                # Skip if formation did not exist at this point
+                # Skip if formation reading did not exist at this point
                 if not self.data[idx][k][0, x, y]:
                     continue
 
-                top_elev = self.data[idx][1, x, y]
+                top_elev = self.data[idx][k][1, x, y]
 
                 if top_elev >= z:
+                    if shallowest_top is None or top_elev > shallowest_top:
+                        shallowest_top = top_elev
+
                     # Bottom elevation is the top of the next formation if it exists and within range
                     if jdx + 1 < n_formations:
                         next_k = formation_keys[jdx + 1]
@@ -94,32 +108,70 @@ class BedrockDataset(Dataset):
                     else:
                         bot_elev = z
 
-                    out[jdx, 0, x, y] = top_elev
-                    out[jdx, 1, x, y] = bot_elev
+                    out[jdx, 0, x, y] = float(top_elev)
+                    out[jdx, 1, x, y] = float(bot_elev)
                     out[jdx, 2, x, y] = 1.0
 
-        return out
+            quat_out[1, x, y] = float(shallowest_top) if shallowest_top is not None else float(z)
+
+        return out, quat_out
 
 def collate_fn(batch):
     """
     Helper function to pad recurrent inputs
-    :param batch: Data batch
+    :param batch: List of (rasters, context, boreholes, formation_info) tuples
     :return: Padded batch
     """
-    padded = pad_sequence(batch, batch_first=True, padding_value=0)
-    lengths = torch.tensor([len(seq) for seq in batch])
+    rasters, existence, contexts, boreholes, formation_infos, quats = zip(*batch)
 
-    return padded, lengths
+    padded_rasters = []
+    padded_existence = []
+    padded_boreholes = []
+    padded_infos = []
+    masks = []
 
-def load_rasters(path):
+    for r, e, b, i in zip(rasters, existence, boreholes, formation_infos):
+        f = r.shape[0]
+        pad = MAX_FORMATIONS - f
+
+        padded_rasters.append(
+            torch.cat([r, torch.zeros(pad, *r.shape[1:])], dim=0)
+        )
+        padded_existence.append(
+            torch.cat([e, torch.zeros(pad, *e.shape[1:])], dim=0)
+        )
+        padded_boreholes.append(
+            torch.cat([b, torch.zeros(pad, *b.shape[1:])], dim=0)
+        )
+        padded_infos.append(
+            torch.cat([i, torch.zeros(pad, i.shape[1])], dim=0)
+        )
+
+        masks.append(
+            torch.cat([torch.ones(f, dtype=torch.bool), torch.zeros(pad, dtype=torch.bool)])
+        )
+
+    return (
+        torch.stack(padded_rasters),
+        torch.stack(padded_existence),
+        torch.stack(contexts),
+        torch.stack(padded_boreholes),
+        torch.stack(padded_infos),
+        torch.stack(quats),
+        torch.stack(masks),
+    )
+
+def load_rasters(path, order=None):
     """
     Loads all rasters stored as numpy arrays at a given path
     :param path: Data path
+    :param order: Optional formation loading order
     :return: Dictionary of formation elevation rasters as numpy arrays,
              Dictionary of geophysical context rasters as numpy arrays
     """
-    order = ['omaq', 'odub', 'ogsv', 'ogpr', 'ogcm', 'odcr', 'opgw', 'ostp', 'opsh', 'opod', 'cjdn', 'cstl', 'ctcg',
-             'cwoc', 'cecr', 'cmts', 'undiff']
+    if order is None:
+        order = ['omaq', 'odub', 'ogsv', 'ogpr', 'ogcm', 'odcr', 'opgw', 'ostp', 'opsh', 'opod', 'cjdn', 'cstl', 'ctcg',
+                 'cwoc', 'cecr', 'cmts', 'undiff']
 
     rasters = {idx: np.load(f'{path}/{idx}_top.npy') for idx in order}
     context = {
@@ -158,7 +210,7 @@ def create_data(rasters, context, count=100, size=200):
         ).reshape(-1, 1)
     )
 
-    shape = rasters['undiff'].shape
+    shape = context['elevation'].shape
 
     rasters = {k: elevation_scaler.transform(v.reshape(-1, 1)).reshape(shape)[1000:-1000, 1000:-1000] for k, v in rasters.items()}
     context['elevation'] = elevation_scaler.transform(context['elevation'].reshape(-1, 1)).reshape(shape)[1000:-1000, 1000:-1000]
@@ -177,7 +229,7 @@ def create_data(rasters, context, count=100, size=200):
     # =============================
     rng = np.random.default_rng()
 
-    shape = rasters['undiff'].shape
+    shape = context['elevation'].shape
 
     data = []
     data_context = []

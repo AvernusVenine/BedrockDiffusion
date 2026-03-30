@@ -1,13 +1,17 @@
 import numpy as np
 import torch
-from diffusers import UNet2DConditionModel, DDIMScheduler
+from diffusers import DDIMScheduler
 import pandas as pd
 import Data
 from Data import BedrockDataset
-from ContextEncoder import ContextEncoder
 import joblib
 import matplotlib.pyplot as plt
-import DiffusionModel
+import StandardDiffusion
+from construction.Encoder import Encoder
+from construction.Embedder import Embedder
+from construction.UNet import UNet
+from construction.Transformer import ConditionTransformer
+from construction.FormationInfo import FORMATION_INFO_DIM
 
 def graph_loss(loss_path):
     """
@@ -21,208 +25,210 @@ def graph_loss(loss_path):
     df.plot()
     plt.show()
 
-def get_random_sample(data_path):
+def get_random_sample(data_path, size, order=None):
     """
     Selects a random sample from data, mostly used to generate an output from the model based on it
     :param data_path: Data path
+    :param size: Raster size
+    :param order: Optional bedrock ordering list
     :return: Dataset containing one sample
     """
-    rasters, elevation = Data.load_rasters(data_path)
-    data, scaler = Data.create_data(rasters, elevation, count=1)
+    rasters, context = Data.load_rasters(data_path, order=order)
+    data, ctx, scaler_dict = Data.create_data(rasters, context, count=1, size=size)
 
-    data[:, :, :, :len(rasters)], existence = DiffusionModel.sanitise_input(data[:, :, :, :len(rasters)])
+    data, ctx = StandardDiffusion.sanitise_input(data, ctx)
 
-    dataset = BedrockDataset(data[:, :, :, :len(rasters)], data[:, :, :, len(rasters):], existence, scaler)
+    dataset = BedrockDataset(data, ctx, scaler_dict, size)
 
     return dataset
 
-def generate(dataset, model_path, scaler_path, save_path, num_steps=100, seed=0, count=100):
+def generate(dataset, model_path, save_path, num_steps=100, seed=0, count=100):
     """
     Generates a model output based on a given sample and seed
     :param dataset: Sample dataset
     :param model_path: Model path
-    :param scaler_path: Scaler path
     :param save_path: Output save path
     :param num_steps: Number of timesteps to take
     :param seed: Optional integer seed
     :param count: Optional integer borehole count
     :return: Model output
     """
-    data = dataset[0]
+    cross_attention_dim = 768
+    seq_len = 64
 
-    elevation = data[1]
-    existence = data
-    boreholes, existence = dataset.select_boreholes(0, count=count)
+    scaler = joblib.load(f'{model_path}_elevation.scl')
 
-    model_dict = torch.load(model_path, map_location='cpu')
-    scaler = joblib.load(scaler_path)
+    rasters, existence, context, boreholes, formation_info, quaternary = dataset[0]
+    boreholes, quaternary = dataset.select_boreholes(0, seed=seed, count=count)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    state_dict = model_dict['model']
-    state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+    model_dict = torch.load(f'{model_path}.mdl', map_location='cpu')
 
-    model = UNet2DConditionModel(
-        sample_size=200,
-        in_channels=model_dict['n_formations'],
-        out_channels=model_dict['n_formations'],
-        cross_attention_dim=512,
-        down_block_types=(
-            'CrossAttnDownBlock2D',
-            'CrossAttnDownBlock2D',
-            'DownBlock2D',
-        ),
-        up_block_types=(
-            'UpBlock2D',
-            'CrossAttnUpBlock2D',
-            'CrossAttnUpBlock2D',
-        ),
-        block_out_channels=(128, 256, 512),
-        layers_per_block=2,
-        attention_head_dim=8,
-        norm_num_groups=32,
-    ).to(device)
-    model.load_state_dict(state_dict)
-    model.eval()
+    geo_context_encoder = Encoder(in_channels=7, cross_attention_dim=cross_attention_dim, seq_len=seq_len).to(device)
+    geo_context_encoder.load_state_dict(model_dict['geo_context_encoder'])
+    geo_context_encoder.eval()
 
-    state_dict = model_dict['context_encoder']
-    state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+    unet = UNet().to(device)
+    unet.load_state_dict(model_dict['unet'])
+    unet.eval()
 
-    context_encoder = ContextEncoder(
-        in_channels=2*model_dict['n_formations'] + 1,
-        cross_attention_dim=512,
-        seq_len=64,
-    ).to(device)
-    context_encoder.load_state_dict(state_dict)
-    context_encoder.eval()
+    formation_embedder = Embedder(in_features=FORMATION_INFO_DIM, out_features=cross_attention_dim).to(device)
+    formation_embedder.load_state_dict(model_dict['formation_embedder'])
+    formation_embedder.eval()
 
-    elevation = elevation.permute(2, 0, 1).unsqueeze(0).to(device)
-    boreholes = boreholes.permute(2, 0, 1).unsqueeze(0).to(device)
-    existence = existence.permute(2, 0, 1).unsqueeze(0).to(device)
+    borehole_encoder = Encoder(in_channels=4, cross_attention_dim=cross_attention_dim, seq_len=seq_len).to(device)
+    borehole_encoder.load_state_dict(model_dict['borehole_encoder'])
+    borehole_encoder.eval()
 
-    context_input = torch.cat([elevation, boreholes, existence], dim=1)
+    quaternary_encoder = Encoder(in_channels=4, cross_attention_dim=cross_attention_dim, seq_len=seq_len).to(device)
+    quaternary_encoder.load_state_dict(model_dict['quaternary_encoder'])
+    quaternary_encoder.eval()
+
+    condition_transformer = ConditionTransformer(cross_attention_dim=cross_attention_dim, num_heads=16).to(device)
+    condition_transformer.load_state_dict(model_dict['condition_transformer'])
+    condition_transformer.eval()
+
+    rasters = rasters.to(device, dtype=torch.bfloat16)
+    existence = existence.to(device, dtype=torch.bfloat16)
+    context = context.to(device, dtype=torch.bfloat16).unsqueeze(0)
+    boreholes = boreholes.to(device, dtype=torch.bfloat16)
+    formation_info = formation_info.to(device, dtype=torch.bfloat16)
+    quaternary = quaternary.to(device, dtype=torch.bfloat16).unsqueeze(0)
 
     with torch.no_grad():
-        encoder_hidden_states = context_encoder(context_input)
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            encoded_context = geo_context_encoder(context)
+            embedded_info = formation_embedder(formation_info).unsqueeze(1)
+            encoded_boreholes = borehole_encoder(boreholes)
+            encoded_quaternary = quaternary_encoder(quaternary)
 
-        scheduler = DDIMScheduler(num_train_timesteps=1000, beta_schedule='squaredcos_cap_v2')
-        scheduler.set_timesteps(num_steps)
+            encoder_hidden_states = condition_transformer(
+                encoded_context,
+                embedded_info,
+                encoded_boreholes,
+                encoded_quaternary
+            )
 
-        torch.manual_seed(seed)
-        sample = torch.randn((1, model_dict['n_formations'], 200, 200), device=device)
+            scheduler = DDIMScheduler(num_train_timesteps=1000, beta_schedule='squaredcos_cap_v2')
+            scheduler.set_timesteps(num_steps)
 
-        idx = 0
-        for t in scheduler.timesteps:
-            t_batch = t.unsqueeze(0).to(device)
+            torch.manual_seed(seed)
 
-            if device.type == 'cuda':
-                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                    predicted_noise = model(sample, t_batch, encoder_hidden_states=encoder_hidden_states).sample
-            else:
-                predicted_noise = model(sample, t_batch, encoder_hidden_states=encoder_hidden_states).sample
+            sample = torch.randn((1, 1, 256, 256), device=device)
+            mask = None
 
-            sample = scheduler.step(predicted_noise, t, sample).prev_sample
+            idx = 0
+            for t in scheduler.timesteps:
+                t_batch = t.unsqueeze(0).to(device)
 
-            idx += 1
-            print(f'Step {idx}')
+                predicted_noise, predicted_mask = unet(sample, t_batch, encoder_hidden_states=encoder_hidden_states)
 
-    generated = sample.squeeze(0).cpu().numpy()
+                sample = scheduler.step(predicted_noise, t, sample).prev_sample
+                mask = predicted_mask
 
-    C, H, W = generated.shape
-    generated = scaler.inverse_transform(generated.reshape(-1, 1)).reshape(C, H, W)
+                idx += 1
+                print(f'Step {idx}')
 
-    np.save(save_path, generated)
+        # =============================
+        # PREDICTED OUTPUT
+        # =============================
 
-    return generated
+        generated = sample.squeeze().cpu().float().numpy()
+        H, W = generated.shape
+        generated = scaler.inverse_transform(generated.reshape(-1, 1)).reshape(H, W)
 
-def sanitise_rasters(data):
+        predicted_existence = (torch.sigmoid(mask.squeeze()) > 0.5).cpu().numpy()
+        generated_masked = np.where(predicted_existence, generated, np.nan)
+
+        np.save(f'{save_path}_predicted_elevation.npy', generated_masked)
+
+        # =============================
+        # TRUE RASTERS
+        # =============================
+
+        true_elev = rasters[0].cpu().float().numpy()
+        H, W = true_elev.shape
+        true_elev = scaler.inverse_transform(true_elev.reshape(-1, 1)).reshape(H, W)
+
+        true_existence = existence.cpu().float().numpy().astype(bool)
+        true_masked = np.where(true_existence, true_elev, np.nan)
+
+        np.save(f'{save_path}_true_elevation.npy', true_masked)
+
+        # =============================
+        # CONTEXT AND BOREHOLES
+        # =============================
+
+        np.save(f'{save_path}_context.npy', context.squeeze(0).cpu().float().numpy())
+        np.save(f'{save_path}_boreholes.npy', boreholes.cpu().float().numpy())
+
+        return generated_masked, true_masked
+
+
+def plot_rasters(save_path, model_path, plot_save_path):
     """
-    Sanitises a given set of rasters by comparing formation thickness on a given order, and if the thickness is below
-    some epsilon the formation does not exist in that area and is replaced with nan
-    :param data: Raster data
-    :return: Sanitised rasters
+    Loads and plots predicted and true formation elevations side by side with the surface elevation map.
+    NaN values (non-existent formation) are shown in white.
+    :param save_path: Path used when saving generation outputs
+    :param model_path: Model path used to load the elevation scaler
+    :param plot_save_path: Optional path to save the figure
     """
-    epsilon = 5.0
+    generated_masked = np.load(f'{save_path}_predicted_elevation.npy')
+    true_masked = np.load(f'{save_path}_true_elevation.npy')
+    context = np.load(f'{save_path}_context.npy')
+    boreholes = np.load(f'{save_path}_boreholes.npy')
 
-    data = data.copy()
+    scaler = joblib.load(f'{model_path}_elevation.scl')
 
-    for idx in range(data.shape[0] - 1):
-        thickness = data[idx] - data[idx+1]
-        existence = thickness <= epsilon
+    shape = context[0].shape
+    surface_elev = scaler.inverse_transform(
+        context[0].reshape(-1, 1)
+    ).reshape(shape)
 
-        data[idx, existence] = np.nan
+    magnetic = context[1]
+    gravity = context[5]
 
-    return data
+    borehole_exists = boreholes[0, 3, :, :]
+    borehole_y, borehole_x = np.where(borehole_exists > 0)
 
-def plot_rasters(output_path, data_path, elevation_path, borehole_path, scaler_path, save_path):
-    """
-    Plots rasters to compare model outputs and ground truth
-    :param output_path: Model output path
-    :param data_path: Ground truth path
-    :param elevation_path: Elevation path
-    :param borehole_path: Borehole path
-    :param scaler_path: Scaler path
-    :param save_path: Save path
-    :return:
-    """
-    output = np.load(output_path) #(num_formation x 200 x 200)
-    data = np.load(data_path) #(200 x 200 x num_formation)
-    elevation = np.load(elevation_path) #(200 x 200 x 1)
-    boreholes = np.load(borehole_path) #(200 x 200 x num_formation)
+    combined = np.concatenate([
+        generated_masked[~np.isnan(generated_masked)],
+        true_masked[~np.isnan(true_masked)]
+    ])
+    vmin, vmax = combined.min(), combined.max()
 
-    scaler = joblib.load(scaler_path)
+    cmap = plt.cm.viridis.copy()
+    cmap.set_bad(color='white')
 
-    data = np.transpose(data, (2, 0, 1))
-    C, H, W = data.shape
-    data = scaler.inverse_transform(data.reshape(-1, 1)).reshape(C, H, W)
-    data = sanitise_rasters(data)
+    fig, axes = plt.subplots(2, 3, figsize=(20, 5))
 
-    boreholes = boreholes.astype(float)
-    boreholes[boreholes == 0] = np.nan
-    boreholes = np.transpose(boreholes, (2, 0, 1))
-    C, H, W = boreholes.shape
+    im0 = axes[0, 0].imshow(true_masked[0], cmap=cmap, vmin=vmin, vmax=vmax)
+    axes[0, 0].set_title('True formation elevation')
+    axes[0, 0].axis('off')
 
-    flat = boreholes.reshape(-1, 1)
-    mask = ~np.isnan(flat[:, 0])
-    flat[mask] = scaler.inverse_transform(flat[mask].reshape(-1, 1))
-    boreholes = flat.reshape(C, H, W)
+    im1 = axes[0, 1].imshow(generated_masked, cmap=cmap, vmin=vmin, vmax=vmax)
+    axes[0, 1].set_title('Predicted formation elevation')
+    axes[0, 1].axis('off')
 
-    output = sanitise_rasters(output)
+    fig.colorbar(im1, ax=axes[0, :2], orientation='vertical', fraction=0.02, pad=0.02, label='Elevation (m)')
 
-    bh_cmap = plt.get_cmap('viridis').copy()
-    bh_cmap.set_bad(color='white')
+    axes[0, 2].imshow(surface_elev, cmap='terrain')
+    axes[0, 2].scatter(borehole_x, borehole_y, s=2, c='red', linewidths=0)
+    axes[0, 2].set_title(f'Elevation and Borehole locations (n={len(borehole_x)})')
+    axes[0, 2].axis('off')
 
-    for f in range(output.shape[0]):
-        vmin = min(np.nanmin(output[f]), np.nanmin(data[f]))
-        vmax = max(np.nanmax(output[f]), np.nanmax(data[f]))
+    im4 = axes[1, 1].imshow(context[1], cmap='RdBu_r')
+    axes[1, 1].set_title('Magnetic')
+    axes[1, 1].axis('off')
+    fig.colorbar(im4, ax=axes[1, 1], orientation='vertical', fraction=0.02, pad=0.02, label='Magnetic (scaled)')
 
-        fig, axes = plt.subplots(1, 3, figsize=(12, 4), constrained_layout=True)
+    im5 = axes[1, 2].imshow(context[5], cmap='RdBu_r')
+    axes[1, 2].set_title('Gravity')
+    axes[1, 2].axis('off')
+    fig.colorbar(im5, ax=axes[1, 2], orientation='vertical', fraction=0.02, pad=0.02, label='Gravity (scaled)')
 
-        for ax, title in zip(axes, ['Predicted', 'Truth', 'Boreholes']):
-            ax.set_title(title)
-            ax.set_xticks([])
-            ax.set_yticks([])
+    plt.tight_layout()
+    plt.savefig(plot_save_path, dpi=150, bbox_inches='tight')
 
-        im = axes[0].imshow(output[f], cmap='viridis', vmin=vmin, vmax=vmax, origin='upper')
-        fig.colorbar(im, ax=axes[0], fraction=0.046, pad=0.04)
-
-        im = axes[1].imshow(data[f], cmap='viridis', vmin=vmin, vmax=vmax, origin='upper')
-        fig.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04)
-
-        im = axes[2].imshow(boreholes[f], cmap=bh_cmap, vmin=vmin, vmax=vmax, origin='upper')
-        fig.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04)
-
-        fig.savefig(f'{save_path}_formation_{f}.png', dpi=150, bbox_inches='tight')
-        plt.close(fig)
-
-    elevation = elevation.squeeze()
-
-    fig, ax = plt.subplots(1, 1, figsize=(5, 5), constrained_layout=True)
-    im = ax.imshow(elevation, cmap='terrain', origin='upper')
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    ax.set_title('Surface Elevation', fontsize=12)
-    ax.set_xticks([])
-    ax.set_yticks([])
-
-    fig.savefig(f'{save_path}_elevation.png', dpi=150, bbox_inches='tight')
-    plt.close(fig)
+    plt.close()
