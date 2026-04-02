@@ -1,12 +1,63 @@
 import numpy as np
 import torch
 from pathlib import Path
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 from construction.FormationInfo import FORMATION_ENCODINGS
+import copy
 
 MAX_FORMATIONS = 17
+
+class GeophysicalDataset(Dataset):
+
+    def __init__(self, data):
+        self.data = data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+class TransformerDataset(Dataset):
+    def __init__(self, data, context, scaler_dict):
+        self.data = data
+        self.context = context
+        self.scaler_dict = scaler_dict
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        shape = self.data[idx].shape
+
+        rasters = self.scaler_dict['elevation'].transform(self.data[idx].reshape(-1, 1)).reshape(shape)
+        context = self.scaler_dict['elevation'].transform(self.context[idx].reshape(-1, 1)).reshape(shape)
+
+        return rasters, context, self.select_boreholes(idx)
+
+    def select_boreholes(self, idx, seed=None, count=None):
+        rng = np.random.default_rng(seed)
+
+        size = self.data[idx].shape[0]
+
+        if count is None:
+            count = rng.integers(0, 301)
+
+        out = torch.full((size, size), np.nan, dtype=torch.float32)
+
+        for _ in range(count):
+            x = rng.integers(0, size)
+            y = rng.integers(0, size)
+
+            out[x, y] = float(self.data[idx][x, y])
+
+        out = self.scaler_dict['borehole'].transform(out.reshape(-1, 1)).reshape(out.shape)
+        out[np.isnan(out)] = -1.0
+
+        out = torch.from_numpy(out)
+        return out
 
 class BedrockDataset(Dataset):
     """
@@ -23,34 +74,32 @@ class BedrockDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        rasters = torch.stack(
-            [torch.tensor(self.data[idx][k][1], dtype=torch.float32) for k in self.data[idx].keys()]
-        )
+        rasters = []
+        for key in self.data[idx].keys():
+            tensor = torch.tensor(self.data[idx][key], dtype=torch.float32)
+            tensor = self.scaler_dict['elevation'].transform(tensor.reshape(-1, 1)).reshape(tensor.shape)
+            rasters.append(tensor)
+        rasters = torch.tensor(rasters)
 
-        existence = torch.stack(
-            [torch.tensor(self.data[idx][k][0], dtype=torch.float32) for k in self.data[idx].keys()]
-        )
+        context = []
+        for key in self.context[idx].keys():
+            tensor = torch.tensor(self.context[idx][key], dtype=torch.float32)
+            tensor = self.scaler_dict[key].transform(tensor.reshape(-1, 1)).reshape(tensor.shape)
+            context.append(tensor)
+        context = torch.tensor(context)
 
-        boreholes, quaternary = self.select_boreholes(idx)
+        boreholes = self.select_boreholes(idx)
 
-        context = torch.stack(
-            [torch.tensor(self.context[idx][k], dtype=torch.float32) for k in self.context[idx].keys()]
-        )
+        return rasters, context, boreholes
 
-        formation_info = torch.stack(
-            [FORMATION_ENCODINGS[k] for k in self.data[idx].keys()]
-        )
-
-        return rasters, existence, context, boreholes, formation_info, quaternary
-
+    # TODO: Reimplement random z values, currently ignored for testings sake
     def select_boreholes(self, idx, seed=None, count=None):
         """
         Selects (0-300) random points with a drilled depth based off a normal distribution
         :param idx: Data index
         :param seed: Optional integer seed for numpy
         :param count: Optional borehole count rather than randomizing it
-        :return: Known formation elevation tensor,
-                 Tensor signifying knowledge of a formations elevation
+        :return: Formation elevation tensor,
         """
         rng = np.random.default_rng(seed)
 
@@ -60,61 +109,20 @@ class BedrockDataset(Dataset):
         if count is None:
             count = rng.integers(0, 301)
 
-        out = torch.zeros((n_formations, 4, self.size, self.size), dtype=torch.float32)
-        quat_out = torch.zeros((4, self.size, self.size), dtype=torch.float32)
-
-        elevation_scaler = self.scaler_dict['elevation']
+        out = torch.full((n_formations, self.size, self.size), torch.nan, dtype=torch.float32)
 
         for _ in range(count):
             x = rng.integers(0, self.size)
             y = rng.integers(0, self.size)
 
-            z = rng.standard_normal() * 175.0 + 265.0
-            z = z / elevation_scaler.scale_[0]
-
-            z = self.context[idx]['elevation'][x, y] - z
-
-            # Mark quaternary borehole existence and top elevation reading
-            quat_out[0, x, y] = float(self.context[idx]['elevation'][x, y])
-            quat_out[2, x, y] = 1.0
-            quat_out[3, x, y] = 1.0
-
-            shallowest_top = None
-
             for jdx, k in enumerate(formation_keys):
-                # Mark borehole existence
-                out[jdx, 3, x, y] = 1.0
+                out[jdx, x, y] = float(self.data[idx][k][x, y])
 
-                # Skip if formation reading did not exist at this point
-                if not self.data[idx][k][0, x, y]:
-                    continue
+        out = self.scaler_dict['borehole'].transform(out.reshape(-1, 1)).reshape(out.shape)
+        out[np.isnan(out)] = -1.0
 
-                top_elev = self.data[idx][k][1, x, y]
-
-                if top_elev >= z:
-                    if shallowest_top is None or top_elev > shallowest_top:
-                        shallowest_top = top_elev
-
-                    # Bottom elevation is the top of the next formation if it exists and within range
-                    if jdx + 1 < n_formations:
-                        next_k = formation_keys[jdx + 1]
-                        next_valid = self.data[idx][next_k][0, x, y]
-                        next_elev = self.data[idx][next_k][1, x, y]
-
-                        if next_valid and next_elev >= z:
-                            bot_elev = next_elev
-                        else:
-                            bot_elev = z
-                    else:
-                        bot_elev = z
-
-                    out[jdx, 0, x, y] = float(top_elev)
-                    out[jdx, 1, x, y] = float(bot_elev)
-                    out[jdx, 2, x, y] = 1.0
-
-            quat_out[1, x, y] = float(shallowest_top) if shallowest_top is not None else float(z)
-
-        return out, quat_out
+        out = torch.from_numpy(out)
+        return out
 
 def collate_fn(batch):
     """
@@ -161,11 +169,12 @@ def collate_fn(batch):
         torch.stack(masks),
     )
 
-def load_rasters(path, order=None):
+def load_rasters(path, order=None, fill_nan=False):
     """
     Loads all rasters stored as numpy arrays at a given path
     :param path: Data path
     :param order: Optional formation loading order
+    :param fill_nan: Whether to fill nan values with the next non-nan elevation
     :return: Dictionary of formation elevation rasters as numpy arrays,
              Dictionary of geophysical context rasters as numpy arrays
     """
@@ -173,19 +182,93 @@ def load_rasters(path, order=None):
         order = ['omaq', 'odub', 'ogsv', 'ogpr', 'ogcm', 'odcr', 'opgw', 'ostp', 'opsh', 'opod', 'cjdn', 'cstl', 'ctcg',
                  'cwoc', 'cecr', 'cmts', 'undiff']
 
-    rasters = {idx: np.load(f'{path}/{idx}_top.npy') for idx in order}
+    rasters = {idx: np.load(f'{path}/{idx}_top.npy')[1000:-1000, 1000:-1000]  for idx in order}
+
+    if fill_nan:
+        for idx, key in enumerate(order[:-1]):
+            mask = np.isnan(rasters[key])
+            if not mask.any():
+                continue
+
+            for next_key in order[:idx+1]:
+                new_mask = mask & np.isnan(rasters[key])
+                if not new_mask.any():
+                    break
+                rasters[key] = np.where(new_mask, rasters[next_key], rasters[key])
+
     context = {
-        'elevation': np.load(f'{path}/elevation.npy'),
-        'magnetic': np.load(f'{path}/magnetic.npy'),
-        'magnetic_1st': np.load(f'{path}/magnetic_1st.npy'),
-        'magnetic_2nd': np.load(f'{path}/magnetic_2nd.npy'),
-        'magnetic_tilt': np.load(f'{path}/magnetic_tilt.npy'),
-        'gravity': np.load(f'{path}/gravity.npy'),
-        'gravity_2nd': np.load(f'{path}/gravity_2nd.npy')
+        'elevation': np.load(f'{path}/elevation.npy')[1000:-1000, 1000:-1000] ,
+        'magnetic': np.load(f'{path}/magnetic.npy')[1000:-1000, 1000:-1000] ,
+        'magnetic_1st': np.load(f'{path}/magnetic_1st.npy')[1000:-1000, 1000:-1000] ,
+        'magnetic_2nd': np.load(f'{path}/magnetic_2nd.npy')[1000:-1000, 1000:-1000] ,
+        'magnetic_tilt': np.load(f'{path}/magnetic_tilt.npy')[1000:-1000, 1000:-1000] ,
+        'gravity': np.load(f'{path}/gravity.npy')[1000:-1000, 1000:-1000] ,
+        'gravity_2nd': np.load(f'{path}/gravity_2nd.npy')[1000:-1000, 1000:-1000]
     }
 
     return rasters, context
 
+def select_data_patches(rasters, context, count, size, fill_nan=True):
+    rng = np.random.default_rng()
+    shape = context['elevation'].shape
+    order = list(rasters.keys())
+
+    data = []
+    ctx = []
+
+    for _ in range(count):
+        x = rng.integers(0, shape[0] - size)
+        y = rng.integers(0, shape[1] - size)
+
+        patch = {k: v[x:x + size, y:y + size] for k, v in rasters.items()}
+
+        if fill_nan:
+            patch = {k: v for k, v in patch.items() if not np.all(np.isnan(v))}
+
+            patch_order = [k for k in order if k in patch]
+            for idx, key in enumerate(patch_order[:-1]):
+                mask = np.isnan(patch[key])
+                if not mask.any():
+                    continue
+
+                for next_key in patch_order[idx+1:]:
+                    new_mask = mask & np.isnan(patch[key])
+                    if not new_mask.any():
+                        break
+                    patch[key] = np.where(new_mask, patch[next_key], patch[key])
+
+
+        data.append(patch)
+        ctx.append({k: v[x:x + size, y:y + size] for k, v in context.items()})
+
+    return data, ctx
+
+def create_scaler_dict(rasters, context):
+    scaler_dict = {}
+
+    elevation_scaler = StandardScaler()
+    elevation_scaler.fit(
+        np.concatenate(
+            [v.reshape(-1) for v in rasters.values()] + [context['elevation'].reshape(-1)]
+        ).reshape(-1, 1)
+    )
+    scaler_dict['elevation'] = elevation_scaler
+
+    borehole_scaler = MinMaxScaler()
+    borehole_scaler.fit(np.array([-500, 1500]).reshape(-1, 1))
+    scaler_dict['borehole'] = borehole_scaler
+
+    for key in context.keys():
+        if key == 'elevation':
+            continue
+
+        scaler = StandardScaler()
+        scaler.fit(context[key].reshape(-1, 1))
+        scaler_dict[key] = scaler
+
+    return scaler_dict
+
+### --- DEPRECIATED --- ###
 def create_data(rasters, context, count=100, size=200):
     """
     Selects K random NxN pieces of land and compresses them into individual data pieces
@@ -209,6 +292,9 @@ def create_data(rasters, context, count=100, size=200):
             [v.reshape(-1) for v in rasters.values()] + [context['elevation'].reshape(-1)]
         ).reshape(-1, 1)
     )
+
+    borehole_scaler = MinMaxScaler()
+    borehole_scaler.fit([v.reshape(-1) for v in rasters.values()])
 
     shape = context['elevation'].shape
 

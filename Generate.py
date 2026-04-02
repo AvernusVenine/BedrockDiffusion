@@ -38,6 +38,9 @@ def get_random_sample(data_path, size, order=None):
 
     data, ctx = StandardDiffusion.sanitise_input(data, ctx)
 
+    #TODO: Remove after testing just elevation
+    ctx = [{k: v for k, v in c.items() if k == 'elevation'} for c in ctx]
+
     dataset = BedrockDataset(data, ctx, scaler_dict, size)
 
     return dataset
@@ -65,7 +68,7 @@ def generate(dataset, model_path, save_path, num_steps=100, seed=0, count=100):
 
     model_dict = torch.load(f'{model_path}.mdl', map_location='cpu')
 
-    geo_context_encoder = Encoder(in_channels=7, cross_attention_dim=cross_attention_dim, seq_len=seq_len).to(device)
+    geo_context_encoder = Encoder(in_channels=1, cross_attention_dim=cross_attention_dim, seq_len=seq_len).to(device)
     geo_context_encoder.load_state_dict(model_dict['geo_context_encoder'])
     geo_context_encoder.eval()
 
@@ -186,9 +189,6 @@ def plot_rasters(save_path, model_path, plot_save_path):
         context[0].reshape(-1, 1)
     ).reshape(shape)
 
-    magnetic = context[1]
-    gravity = context[5]
-
     borehole_exists = boreholes[0, 3, :, :]
     borehole_y, borehole_x = np.where(borehole_exists > 0)
 
@@ -201,32 +201,32 @@ def plot_rasters(save_path, model_path, plot_save_path):
     cmap = plt.cm.viridis.copy()
     cmap.set_bad(color='white')
 
-    fig, axes = plt.subplots(2, 3, figsize=(20, 5))
+    fig, axes = plt.subplots(1, 5, figsize=(25, 5))
 
-    im0 = axes[0, 0].imshow(true_masked[0], cmap=cmap, vmin=vmin, vmax=vmax)
-    axes[0, 0].set_title('True formation elevation')
-    axes[0, 0].axis('off')
+    im0 = axes[0].imshow(true_masked[0], cmap=cmap, vmin=vmin, vmax=vmax)
+    axes[0].set_title('True formation elevation')
+    axes[0].axis('off')
 
-    im1 = axes[0, 1].imshow(generated_masked, cmap=cmap, vmin=vmin, vmax=vmax)
-    axes[0, 1].set_title('Predicted formation elevation')
-    axes[0, 1].axis('off')
+    im1 = axes[1].imshow(generated_masked, cmap=cmap, vmin=vmin, vmax=vmax)
+    axes[1].set_title('Predicted formation elevation')
+    axes[1].axis('off')
 
-    fig.colorbar(im1, ax=axes[0, :2], orientation='vertical', fraction=0.02, pad=0.02, label='Elevation (m)')
+    fig.colorbar(im1, ax=axes[:2], orientation='vertical', fraction=0.02, pad=0.02, label='Elevation (m)')
 
-    axes[0, 2].imshow(surface_elev, cmap='terrain')
-    axes[0, 2].scatter(borehole_x, borehole_y, s=2, c='red', linewidths=0)
-    axes[0, 2].set_title(f'Elevation and Borehole locations (n={len(borehole_x)})')
-    axes[0, 2].axis('off')
+    axes[2].imshow(surface_elev, cmap='terrain')
+    axes[2].scatter(borehole_x, borehole_y, s=2, c='red', linewidths=0)
+    axes[2].set_title(f'Elevation and Borehole locations (n={len(borehole_x)})')
+    axes[2].axis('off')
 
-    im4 = axes[1, 1].imshow(context[1], cmap='RdBu_r')
-    axes[1, 1].set_title('Magnetic')
-    axes[1, 1].axis('off')
-    fig.colorbar(im4, ax=axes[1, 1], orientation='vertical', fraction=0.02, pad=0.02, label='Magnetic (scaled)')
+    """im4 = axes[3].imshow(context[1], cmap='RdBu_r')
+    axes[3].set_title('Magnetic')
+    axes[3].axis('off')
+    fig.colorbar(im4, ax=axes[3], orientation='vertical', fraction=0.02, pad=0.02, label='Magnetic (scaled)')
 
-    im5 = axes[1, 2].imshow(context[5], cmap='RdBu_r')
-    axes[1, 2].set_title('Gravity')
-    axes[1, 2].axis('off')
-    fig.colorbar(im5, ax=axes[1, 2], orientation='vertical', fraction=0.02, pad=0.02, label='Gravity (scaled)')
+    im5 = axes[4].imshow(context[5], cmap='RdBu_r')
+    axes[4].set_title('Gravity')
+    axes[4].axis('off')
+    fig.colorbar(im5, ax=axes[4], orientation='vertical', fraction=0.02, pad=0.02, label='Gravity (scaled)')"""
 
     plt.tight_layout()
     plt.savefig(plot_save_path, dpi=150, bbox_inches='tight')

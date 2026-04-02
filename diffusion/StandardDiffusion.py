@@ -47,8 +47,6 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100, load_model=False):
     rasters, context = Data.load_rasters(data_path, order=['ogcm'])
     data, context, scaler_dict = Data.create_data(rasters, context, count=1500, size=raster_size)
 
-    for k, v in scaler_dict.items():
-        joblib.dump(v, f'{save_path}_{k}.scl')
 
     data, context = sanitise_input(data, context)
 
