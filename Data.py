@@ -9,6 +9,78 @@ import copy
 
 MAX_FORMATIONS = 17
 
+class TransformerDataset(Dataset):
+    def __init__(self, data, context, scaler_dict, patches, count, size):
+        self.data = data
+        self.context = context
+        self.scaler_dict = scaler_dict
+        self.patches = patches
+        self.count = count
+        self.size = size
+
+        self.indices = None
+
+    def __len__(self):
+        return self.count
+
+    def __getitem__(self, idx):
+        if idx == 0:
+            self.generate_indices()
+
+        x, y = self.patches[self.indices[idx]]
+
+        rasters = np.array([r[x:x+self.size, y:y+self.size] for r in self.data.values()])
+        rasters = np.array([r for r in rasters if ~np.isnan(r).all()])
+
+        for idx in range(len(rasters) - 1):
+            mask = np.isnan(rasters[idx])
+
+            if not mask.any():
+                continue
+
+            for next_raster in rasters[idx+1:]:
+                mask = np.isnan(rasters[idx])
+
+                if not mask.any():
+                    break
+
+                rasters[idx] = np.where(mask, next_raster, rasters[idx])
+
+        boreholes = self.select_boreholes(rasters)
+
+        rasters = self.scaler_dict['elevation'].transform(rasters.reshape(-1, 1)).reshape(rasters.shape)
+        rasters = torch.from_numpy(rasters)
+
+        context = self.context['elevation'][x:x+self.size, y:y+self.size]
+        context = self.scaler_dict['elevation'].transform(context.reshape(-1, 1)).reshape(context.shape)
+        context = torch.from_numpy(context).unsqueeze(0).repeat(rasters.shape[0], 1, 1)
+
+        return rasters, context, boreholes
+
+    def generate_indices(self):
+        rng = np.random.default_rng()
+        self.indices = rng.choice(len(self.patches), size=self.count, replace=False)
+
+    def select_boreholes(self, rasters, seed=None, count=None):
+        rng = np.random.default_rng(seed)
+
+        if count is None:
+            count = rng.integers(10, 301)
+
+        out = torch.full(rasters.shape, np.nan, dtype=torch.float32)
+
+        for _ in range(count):
+            x = rng.integers(0, self.size)
+            y = rng.integers(0, self.size)
+
+            out[:, x, y] = torch.from_numpy(rasters[:, x, y])
+
+        out = self.scaler_dict['borehole'].transform(out.reshape(-1, 1)).reshape(out.shape)
+        out[np.isnan(out)] = -1.0
+
+        out = torch.from_numpy(out)
+        return out
+
 class GeophysicalDataset(Dataset):
 
     def __init__(self, data):
@@ -19,45 +91,6 @@ class GeophysicalDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.data[idx]
-
-class TransformerDataset(Dataset):
-    def __init__(self, data, context, scaler_dict):
-        self.data = data
-        self.context = context
-        self.scaler_dict = scaler_dict
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        shape = self.data[idx].shape
-
-        rasters = self.scaler_dict['elevation'].transform(self.data[idx].reshape(-1, 1)).reshape(shape)
-        context = self.scaler_dict['elevation'].transform(self.context[idx].reshape(-1, 1)).reshape(shape)
-
-        return rasters, context, self.select_boreholes(idx)
-
-    def select_boreholes(self, idx, seed=None, count=None):
-        rng = np.random.default_rng(seed)
-
-        size = self.data[idx].shape[0]
-
-        if count is None:
-            count = rng.integers(0, 301)
-
-        out = torch.full((size, size), np.nan, dtype=torch.float32)
-
-        for _ in range(count):
-            x = rng.integers(0, size)
-            y = rng.integers(0, size)
-
-            out[x, y] = float(self.data[idx][x, y])
-
-        out = self.scaler_dict['borehole'].transform(out.reshape(-1, 1)).reshape(out.shape)
-        out[np.isnan(out)] = -1.0
-
-        out = torch.from_numpy(out)
-        return out
 
 class BedrockDataset(Dataset):
     """
@@ -124,6 +157,26 @@ class BedrockDataset(Dataset):
         out = torch.from_numpy(out)
         return out
 
+def find_valid_patches(mask, N, M):
+    H, W = mask.shape
+
+    invalid = (1 - mask).astype(np.float32)
+    integral = np.cumsum(np.cumsum(invalid, axis=0), axis=1)
+
+    bottom_right = integral[N-1:H, M-1:W]
+    top = np.zeros_like(bottom_right)
+    left = np.zeros_like(bottom_right)
+    top_left = np.zeros_like(bottom_right)
+
+    top[1:, :] = integral[:H-N, M-1:W]
+    left[:, 1:] = integral[N-1:H, :W-M]
+    top_left[1:, 1:] = integral[:H-N, :W-M]
+
+    invalid_counts = bottom_right - top - left + top_left
+    rows, cols = np.where(invalid_counts == 0)
+
+    return list(zip(rows.tolist(), cols.tolist()))
+
 def collate_fn(batch):
     """
     Helper function to pad recurrent inputs
@@ -179,10 +232,10 @@ def load_rasters(path, order=None, fill_nan=False):
              Dictionary of geophysical context rasters as numpy arrays
     """
     if order is None:
-        order = ['omaq', 'odub', 'ogsv', 'ogpr', 'ogcm', 'odcr', 'opgw', 'ostp', 'opsh', 'opod', 'cjdn', 'cstl', 'ctcg',
-                 'cwoc', 'cecr', 'cmts', 'undiff']
+        order = ['kwnd', 'dlp', 'dspl', 'omaq', 'odub', 'ogsv', 'ogpr', 'ogcm', 'odcr', 'opgw', 'ostp', 'opsh', 'opod',
+                 'cp', 'cjdn', 'cstl', 'ctcg', 'cwoc', 'cecr', 'cmts']
 
-    rasters = {idx: np.load(f'{path}/{idx}_top.npy')[1000:-1000, 1000:-1000]  for idx in order}
+    rasters = {idx: np.load(f'{path}/{idx}_top.npy')  for idx in order}
 
     if fill_nan:
         for idx, key in enumerate(order[:-1]):
@@ -197,13 +250,13 @@ def load_rasters(path, order=None, fill_nan=False):
                 rasters[key] = np.where(new_mask, rasters[next_key], rasters[key])
 
     context = {
-        'elevation': np.load(f'{path}/elevation.npy')[1000:-1000, 1000:-1000] ,
-        'magnetic': np.load(f'{path}/magnetic.npy')[1000:-1000, 1000:-1000] ,
-        'magnetic_1st': np.load(f'{path}/magnetic_1st.npy')[1000:-1000, 1000:-1000] ,
-        'magnetic_2nd': np.load(f'{path}/magnetic_2nd.npy')[1000:-1000, 1000:-1000] ,
-        'magnetic_tilt': np.load(f'{path}/magnetic_tilt.npy')[1000:-1000, 1000:-1000] ,
-        'gravity': np.load(f'{path}/gravity.npy')[1000:-1000, 1000:-1000] ,
-        'gravity_2nd': np.load(f'{path}/gravity_2nd.npy')[1000:-1000, 1000:-1000]
+        'elevation': np.load(f'{path}/elevation.npy'),
+        #'magnetic': np.load(f'{path}/magnetic.npy')[1000:-1000, 1000:-1000] ,
+        #'magnetic_1st': np.load(f'{path}/magnetic_1st.npy')[1000:-1000, 1000:-1000] ,
+        #'magnetic_2nd': np.load(f'{path}/magnetic_2nd.npy')[1000:-1000, 1000:-1000] ,
+        #'magnetic_tilt': np.load(f'{path}/magnetic_tilt.npy')[1000:-1000, 1000:-1000] ,
+        #'gravity': np.load(f'{path}/gravity.npy')[1000:-1000, 1000:-1000] ,
+        #'gravity_2nd': np.load(f'{path}/gravity_2nd.npy')[1000:-1000, 1000:-1000]
     }
 
     return rasters, context

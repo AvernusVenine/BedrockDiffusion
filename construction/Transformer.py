@@ -22,12 +22,27 @@ class PositionalEncoding(nn.Module):
     def __init__(self, embed_dim, seq_len):
         super().__init__()
 
-        position = torch.arange(seq_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, embed_dim, 2) * (-math.log(10000.0) / embed_dim))
+        H = math.ceil(seq_len ** 0.5)
 
-        pe = torch.zeros(1, seq_len, embed_dim)
-        pe[0, :, 0::2] = torch.sin(position * div_term)
-        pe[0, :, 1::2] = torch.cos(position * div_term)
+        div_term = torch.exp(torch.arange(0, embed_dim//2, 2) * (-math.log(10000.0) / embed_dim))
+
+        row_pos = torch.arange(H).unsqueeze(1)
+        col_pos = torch.arange(H).unsqueeze(1)
+
+        row_enc = torch.zeros(H, embed_dim//2)
+        row_enc[:, 0::2] = torch.sin(row_pos * div_term)
+        row_enc[:, 1::2] = torch.cos(row_pos * div_term)
+
+        col_enc = torch.zeros(H, embed_dim//2)
+        col_enc[:, 0::2] = torch.sin(col_pos * div_term)
+        col_enc[:, 1::2] = torch.cos(col_pos * div_term)
+
+        row_enc = row_enc.unsqueeze(1).expand(H, H, embed_dim//2)
+        col_enc = col_enc.unsqueeze(0).expand(H, H, embed_dim//2)
+
+        pe = torch.cat([row_enc, col_enc], dim=-1)
+        pe = pe.reshape(1, H**2, embed_dim)
+
         self.register_buffer('pe', pe)
 
     def forward(self, X):
@@ -62,7 +77,7 @@ class BedrockTransformer(nn.Module):
         super().__init__()
 
         ###--- Condition Encoder --- ###
-        self.pool = AvgPoolFilter2D(16, 16, 0, filter_value=-1)
+        self.pool = AvgPoolFilter2D(patch_size, raster_size // patch_size, 0, filter_value=-1)
         self.encoder = nn.Sequential(
             nn.Conv2d(in_channels=1, out_channels=embed_dim, kernel_size=3, padding=1),
             nn.GroupNorm(8, embed_dim),

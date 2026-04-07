@@ -12,7 +12,7 @@ def test_transformer(data_path, model_path, save_path, formations):
     raster_size = 256
     patch_size = 16
     embed_dim = 768
-    data_count = 5
+    data_count = 1
 
     rasters, context = Data.load_rasters(data_path)
     scaler_dict = Data.create_scaler_dict(rasters, context)
@@ -47,46 +47,61 @@ def test_transformer(data_path, model_path, save_path, formations):
     ).to(device)
     model.load_state_dict(model_dict['model'])
 
-    rasters, context, boreholes = dataset[0]
+    results = []
 
-    rasters = torch.from_numpy(rasters)
-    context = torch.from_numpy(context)
+    for rasters, context, boreholes in dataset:
+        rasters = torch.from_numpy(rasters)
+        context = torch.from_numpy(context)
 
-    model.eval()
+        model.eval()
 
-    with torch.no_grad():
-        context = context.to(device, dtype=torch.float32).reshape(1, 1, raster_size, raster_size)
-        boreholes = boreholes.to(device, dtype=torch.float32).reshape(1, 1, raster_size, raster_size)
+        with torch.no_grad():
+            context = context.to(device, dtype=torch.float32).reshape(1, 1, raster_size, raster_size)
+            boreholes = boreholes.to(device, dtype=torch.float32).reshape(1, 1, raster_size, raster_size)
 
-        predicted = model(context, boreholes)
+            predicted = model(context, boreholes)
 
-    predicted = predicted.squeeze().cpu().float().numpy()
-    actual = rasters.numpy()
-    elevation = context.squeeze().cpu().float().numpy()
-    borehole_map = boreholes.squeeze().cpu().float().numpy()
+            results.append({
+                'elevation': context.squeeze().cpu().float().numpy(),
+                'predicted': predicted.squeeze().cpu().float().numpy(),
+                'actual': rasters.numpy(),
+                'boreholes': boreholes.squeeze().cpu().float().numpy()
+            })
 
-    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+    all_values = np.concatenate([
+        np.stack([r['elevation'], r['predicted'], r['actual']]).ravel()
+        for r in results
+    ])
+    vmin, vmax = all_values.min(), all_values.max()
 
-    axes[0].imshow(elevation, cmap='terrain')
-    axes[0].set_title('Elevation')
+    fig, axes = plt.subplots(len(results), 4, figsize=(20, 5*len(results)))
 
-    axes[1].imshow(predicted, cmap='terrain')
-    axes[1].set_title('Predicted')
+    if len(results) == 1:
+        axes = axes[np.newaxis, :]
 
-    im2 = axes[2].imshow(actual, cmap='terrain')
-    axes[2].set_title('Actual')
-    plt.colorbar(im2, ax=axes[2])
+    for row, r in enumerate(results):
+        axes[row, 0].imshow(r['elevation'], cmap='terrain', vmin=vmin, vmax=vmax)
+        axes[row, 0].set_title('Elevation')
 
-    axes[3].imshow(borehole_map != -1, cmap='binary')
-    axes[3].set_title('Boreholes')
+        axes[row, 1].imshow(r['predicted'], cmap='terrain', vmin=vmin, vmax=vmax)
+        axes[row, 1].set_title(f'{formations[row]} Predicted')
+
+        axes[row, 2].imshow(r['actual'], cmap='terrain', vmin=vmin, vmax=vmax)
+        axes[row, 2].set_title(f'{formations[row]} Actual')
+
+        axes[row, 3].imshow(r['boreholes'] > 0, cmap='binary')
+        axes[row, 3].set_title('Boreholes')
 
     plt.savefig(f'{save_path}.png')
+    plt.close()
 
 def train_transformer(data_path, save_path, lr=1e-4, max_epochs=100):
     raster_size = 256
-    patch_size = 16
+    patch_size = 8
     embed_dim = 768
-    data_count = 1500
+    mlp_dim = 1024
+    data_count = 7500
+    depth = 10
     formations = ['omaq', 'odub', 'ogsv', 'ogpr', 'ogcm', 'odcr', 'opgw', 'ostp', 'opsh', 'opod']
 
     # =============================
@@ -99,26 +114,29 @@ def train_transformer(data_path, save_path, lr=1e-4, max_epochs=100):
     for k, v in scaler_dict.items():
         joblib.dump(v, f'{save_path}_{k}.scl')
 
-    context = {'elevation': context['elevation']}
+    valid_mask = np.zeros(list(rasters.values())[0].shape, dtype=bool)
 
-    data, ctx = Data.select_data_patches(rasters, context, data_count, raster_size, fill_nan=True)
+    for v in rasters.values():
+        mask = ~np.isnan(v)
+        valid_mask = mask | valid_mask
 
-    filtered_data = []
-    filtered_ctx = []
+    ###--- Test Dataset ---###
+    ###--- Remove test data sections from the continuous dataset ---###
+    patches = Data.find_valid_patches(valid_mask, raster_size, raster_size)
 
-    for patch, c in zip(data, ctx):
-        filtered = {k: v for k, v in patch.items() if k in formations}
-        if filtered:
-            for formation in filtered.values():
-                filtered_data.append(formation)
-                filtered_ctx.append(c['elevation'])
+    test_size = int(data_count * 0.1)
 
-    dataset = Data.TransformerDataset(filtered_data, filtered_ctx, scaler_dict)
+    indices = np.random.choice(len(patches), size=test_size, replace=False)
+    test_indices = [patches[i] for i in indices]
 
-    train_size = int(0.8 * len(dataset))
-    test_size = int(len(dataset) - train_size)
+    for x, y in test_indices:
+        valid_mask[x:x+raster_size, y:y+raster_size] = False
 
-    train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+    test_dataset = Data.TransformerDataset(rasters, context, scaler_dict, test_indices, test_size, raster_size)
+
+    ###--- Train Dataset ---###
+    patches = Data.find_valid_patches(valid_mask, raster_size, raster_size)
+    train_dataset = Data.TransformerDataset(rasters, context, scaler_dict, patches, data_count, raster_size)
 
     train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False, num_workers=4, pin_memory=True)
@@ -134,8 +152,8 @@ def train_transformer(data_path, save_path, lr=1e-4, max_epochs=100):
         patch_size,
         embed_dim,
         num_heads=8,
-        depth=6,
-        mlp_dim=1024,
+        depth=depth,
+        mlp_dim=mlp_dim,
     ).to(device)
     model = torch.compile(model)
 
@@ -159,9 +177,15 @@ def train_transformer(data_path, save_path, lr=1e-4, max_epochs=100):
 
         train_loss = 0.0
         for rasters, context, boreholes in train_loader:
-            rasters = rasters.to(device, dtype=torch.bfloat16).unsqueeze(1)
-            context = context.to(device, dtype=torch.bfloat16).unsqueeze(1)
-            boreholes = boreholes.to(device, dtype=torch.bfloat16).unsqueeze(1)
+            rasters = rasters.to(device, dtype=torch.bfloat16)
+            context = context.to(device, dtype=torch.bfloat16)
+            boreholes = boreholes.to(device, dtype=torch.bfloat16)
+
+            B, C, H, W = rasters.shape
+
+            rasters = rasters.reshape(B * C, 1, H, W)
+            boreholes = boreholes.reshape(B * C, 1 , H, W)
+            context = context.reshape(B * C, 1, H, W)
 
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 predicted = model(context, boreholes)
@@ -187,9 +211,15 @@ def train_transformer(data_path, save_path, lr=1e-4, max_epochs=100):
 
         with torch.no_grad():
             for rasters, context, boreholes in test_loader:
-                rasters = rasters.to(device, dtype=torch.bfloat16).unsqueeze(1)
-                context = context.to(device, dtype=torch.bfloat16).unsqueeze(1)
-                boreholes = boreholes.to(device, dtype=torch.bfloat16).unsqueeze(1)
+                rasters = rasters.to(device, dtype=torch.bfloat16)
+                context = context.to(device, dtype=torch.bfloat16)
+                boreholes = boreholes.to(device, dtype=torch.bfloat16)
+
+                B, C, H, W = rasters.shape
+
+                rasters = rasters.reshape(B * C, 1, H, W)
+                boreholes = boreholes.reshape(B * C, 1, H, W)
+                context = context.reshape(B * C, 1, H, W)
 
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                     predicted = model(context, boreholes)
@@ -212,6 +242,10 @@ def train_transformer(data_path, save_path, lr=1e-4, max_epochs=100):
                     'model': model._orig_mod.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'loss': best_loss,
+                    'max_size': raster_size,
+                    'patch_size': patch_size,
+                    'depth': depth,
+                    'mlp_dim': mlp_dim,
                 },
                 f'{save_path}.mdl'
             )
