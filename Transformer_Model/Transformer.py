@@ -19,21 +19,20 @@ class PatchEmbedding(nn.Module):
 class PositionalEncoding(nn.Module):
     def __init__(self, embed_dim, H, W, mod_res, base_res):
         super().__init__()
-
+    
         G = (mod_res / base_res)
-
         div_term = 1.0 / (10000.0 ** (torch.arange(0, embed_dim // 2).float() / embed_dim))
-
+    
         row_pos = torch.arange(H).float()
         col_pos = torch.arange(W).float()
-
-        row_enc = torch.sin(G * row_pos.unsqueeze(1) * div_term.unsqueeze(0))
-        col_enc = torch.cos(G * col_pos.unsqueeze(1) * div_term.unsqueeze(0))
-
-        pe = torch.zeros(H, W, embed_dim)
-        pe[:, 0::2] = row_enc
-        pe[:, 1::2] = col_enc
-
+    
+        row_enc = torch.sin(G * row_pos.unsqueeze(1) * div_term.unsqueeze(0))  # [H, embed_dim//2]
+        col_enc = torch.cos(G * col_pos.unsqueeze(1) * div_term.unsqueeze(0))  # [W, embed_dim//2]
+    
+        row_enc = row_enc.unsqueeze(1).expand(H, W, -1)  # [H, W, embed_dim//2]
+        col_enc = col_enc.unsqueeze(0).expand(H, W, -1)  # [H, W, embed_dim//2]
+    
+        pe = torch.cat([row_enc, col_enc], dim=-1)        # [H, W, embed_dim]
         self.register_buffer('pe', pe.reshape(1, H*W, embed_dim))
         self.register_buffer('div_term', div_term)
         self.G = G

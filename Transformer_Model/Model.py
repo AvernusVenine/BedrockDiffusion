@@ -74,80 +74,70 @@ def prepare_batch(elevation, top_rasters, base_rasters, alphaearth, dataset, bh_
 
     return elevation, top_rasters, existence, alphaearth, boreholes
 
-def test(data_path, model_path, save_path):
-    raster_size = 64
-    patch_size = 16
-    embed_dim = 768
-    mlp_dim = 1024
-    depth = 6
+def test(data_path, model_path, save_path, bh_count=10, formations=None):
+    model_dict = torch.load(f'{model_path}.mdl')
 
-    rasters, context = Data.load_rasters(data_path)
+    raster_size = model_dict['raster_size']
+    patch_size = model_dict['patch_size']
+    embed_dim = model_dict['embed_dim']
+    encoder_depth = model_dict['encoder_depth']
+    decoder_depth = model_dict['decoder_depth']
+    mlp_dim = model_dict['mlp_dim']
 
-    scaler = joblib.load(f'{model_path}_elevation.scl')
-    scaler_dict = {'elevation': scaler}
+    if formations is None:
+        formations = ['kwnd', 'dlp', 'dspl', 'omaq', 'odub', 'ogsv', 'ogpr', 'ogcm', 'odcr', 'opgw', 'ostp', 'opsh',
+                      'opod', 'cp', 'cjdn', 'cstl', 'ctcg', 'cwoc', 'cecr', 'cmts']
 
-    valid_mask = np.zeros(context['elevation'].shape, dtype=bool)
-    for sparse in rasters.values():
-        valid_mask[sparse['rows'], sparse['cols']] = True
+    counties = [Data.CountySource(data_path, formations)]
+    scaler_dict = {'elevation': joblib.load(f'{model_path}_elevation.scl')}
 
-    patches = Data.find_valid_patches(valid_mask, raster_size, raster_size)
-
-    dataset = Data.TransformerDataset(rasters, context, scaler_dict, patches, 1, 256)
-    dataset.generate_indices()
+    dataset = Data.MultiCountyDataset(counties, scaler_dict, 500, raster_size, 1.0)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    model_dict = torch.load(f'{model_path}.mdl')
 
     model = BedrockTransformer(
         raster_size,
         patch_size,
         embed_dim,
         num_heads=8,
-        depth=depth,
-        mlp_dim=mlp_dim,
+        encoder_depth=encoder_depth,
+        decoder_depth=decoder_depth,
+        mlp_dim=mlp_dim
     ).to(device)
     model.load_state_dict(model_dict['model'])
 
-    model.eval()
+    dataset.generate_indices()
 
-    rasters, context, boreholes = dataset[0]
+    elevation, top_rasters, base_rasters, alphaearth = dataset.get_full(0)
 
-    with torch.no_grad():
-        context = context.to(device, dtype=torch.float32)
-        boreholes = boreholes.to(device, dtype=torch.float32)
+    boreholes = [dataset.select_boreholes(top, base, count=bh_count) for top, base in zip(top_rasters, base_rasters)]
+    boreholes = torch.stack(boreholes)
 
-        predicted = model(context, boreholes)
+    elevation = elevation.to(device, dtype=torch.float32)
+    alphaearth = alphaearth.to(device, dtype=torch.float32)
+    boreholes = boreholes.to(device, dtype=torch.float32)
 
-    context = context.squeeze(1).cpu().float().numpy()
-    predicted = predicted.squeeze(1).cpu().float().numpy()
-    rasters = rasters.squeeze(1).numpy()
-    boreholes = boreholes[:, 2].cpu().float().numpy()
+    predicted_elevation, predicted_existence = model(elevation, boreholes, alphaearth)
 
-    predicted[np.isnan(rasters)] = np.nan
+    predicted_elevation = predicted_elevation.cpu().float().numpy()
+    predicted_existence = predicted_existence.cpu().float().numpy()
 
-    all_values = np.concatenate([context.ravel(), predicted.ravel(), boreholes.ravel()])
-    vmin, vmax = np.nanmin(all_values), np.nanmax(all_values)
+    existence = ((top_rasters - base_rasters) > 0.0).cpu().float().numpy()
 
-    fig, axes = plt.subplots(len(rasters), 4, figsize=(20, 5*len(rasters)))
+    predicted_elevation = scaler_dict['elevation'].inverse_transform(predicted_elevation.reshape(-1, 1)).reshape(predicted_elevation.shape)
+    top_rasters = scaler_dict['elevation'].inverse_transform(top_rasters.reshape(-1, 1)).reshape(elevation.shape)
+    elevation = scaler_dict['elevation'].inverse_transform(elevation.reshape(-1, 1)).reshape(elevation.shape)
 
-    for row in range(len(predicted)):
-        axes[row, 0].imshow(context[row], cmap='terrain', vmin=vmin, vmax=vmax)
-        axes[row, 0].set_title('Elevation')
+    joblib.dump({
+        'surface_elevation': elevation,
+        'predicted_elevation': predicted_elevation,
+        'predicted_existence': predicted_existence,
+        'actual_elevation': top_rasters,
+        'actual_existence': existence
+    }, save_path)
 
-        axes[row, 1].imshow(predicted[row], cmap='terrain', vmin=vmin, vmax=vmax)
-        axes[row, 1].set_title(f'Predicted')
 
-        axes[row, 2].imshow(rasters[row], cmap='terrain', vmin=vmin, vmax=vmax)
-        axes[row, 2].set_title(f'Actual')
-
-        axes[row, 3].imshow(boreholes[row] > 0, cmap='binary')
-        axes[row, 3].set_title('Boreholes')
-
-    plt.savefig(f'{save_path}.png')
-    plt.close()
-
-def train(data_path, save_path, lr=1e-4, max_epochs=100):
+def train(data_path, save_path, lr=1e-4, max_epochs=100, load_model=False):
     raster_size = 64
     patch_size = 16
     embed_dim = 512
@@ -197,6 +187,17 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+    model_dict = None
+    if load_model:
+        model_dict = torch.load(f'{save_path}.mdl')
+
+        raster_size = model_dict['raster_size']
+        patch_size = model_dict['patch_size']
+        embed_dim = model_dict['embed_dim']
+        encoder_depth = model_dict['encoder_depth']
+        decoder_depth = model_dict['decoder_depth']
+        mlp_dim = model_dict['mlp_dim']
+
     model = BedrockTransformer(
         raster_size,
         patch_size,
@@ -206,6 +207,10 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
         decoder_depth=decoder_depth,
         mlp_dim=mlp_dim,
     ).to(device)
+
+    if load_model:
+        model.load_state_dict(model_dict['model'])
+
     model = torch.compile(model)
 
     optimizer = torch.optim.AdamW(
@@ -213,6 +218,9 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
         lr=lr,
         weight_decay=1e-4,
     )
+
+    if load_model:
+        optimizer.load_state_dict(model_dict['optimizer'])
 
     best_loss = np.inf
     loss_dict = {'train': [], 'test': []}
@@ -237,6 +245,11 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
 
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 elev_mask, ae_mask = mask_scheduler.sample(epoch, elevation.shape[0], device)
+
+                data = [elevation, boreholes, alphaearth, elev_mask, ae_mask, top_rasters, base_rasters]
+                for idx in range(len(data)):
+                    if (data[idx] == np.nan).any():
+                        print(f'NaN found in {idx}')
 
                 predicted_elevation, predicted_existence = model(elevation, boreholes, alphaearth, elev_mask, ae_mask)
 
@@ -286,6 +299,23 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
         loss_dict['test'].append(test_loss / len(test_loader))
 
         pd.DataFrame(loss_dict).to_csv(f'{save_path}_loss.csv')
+
+        if epoch == 99:
+            torch.save(
+                {
+                    'epoch': epoch + 1,
+                    'model': model._orig_mod.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'loss': test_loss,
+                    'raster_size': raster_size,
+                    'patch_size': patch_size,
+                    'embed_dim': embed_dim,
+                    'encoder_depth': encoder_depth,
+                    'decoder_depth': decoder_depth,
+                    'mlp_dim': mlp_dim,
+                },
+                f'{save_path}_pretrain.mdl'
+            )
 
         if test_loss < best_loss:
             best_loss = test_loss
