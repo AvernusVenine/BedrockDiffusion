@@ -72,11 +72,10 @@ class TransformerCrossBlock(nn.Module):
         self.norm3 = nn.LayerNorm(embed_dim)
 
     def forward(self, X, ctx):
-        ctx = self.norm1(ctx)
-
-        X = X + self.cross_attn(self.norm2(X), ctx, ctx)[0]
+        ctx = self.norm1(ctx).float()
+        X_f = self.norm2(X).float()
+        X = X + self.cross_attn(X_f, ctx, ctx)[0].to(X.dtype)
         X = X + self.mlp(self.norm3(X))
-
         return X
 
 class TransformerBlock(nn.Module):
@@ -92,7 +91,7 @@ class TransformerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(embed_dim)
 
     def forward(self, X):
-        X_norm = self.norm1(X)
+        X_norm = self.norm1(X).float()
         X = X + self.attn(X_norm, X_norm, X_norm)[0]
         X = X + self.mlp(self.norm2(X))
         return X
@@ -102,6 +101,10 @@ class BedrockTransformer(nn.Module):
     def __init__(self, raster_size, patch_size, embed_dim, num_heads, encoder_depth, decoder_depth, mlp_dim):
         super().__init__()
 
+        bedrock_res = 30
+        ae_res = 10
+        elev_res = 10
+
         self.embed_dim = embed_dim
         self.H = int(raster_size // patch_size)
         self.W = int(raster_size // patch_size)
@@ -110,20 +113,20 @@ class BedrockTransformer(nn.Module):
         self.bedrock_query_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         nn.init.trunc_normal_(self.bedrock_query_token, std=0.02)
 
-        self.query_pos_encoding = PositionalEncoding(embed_dim, self.H, self.W, patch_size, patch_size)
+        self.query_pos_encoding = PositionalEncoding(embed_dim, self.H, self.W, bedrock_res, bedrock_res)
 
         ###--- Borehole Embedding ---###
         #- (Existence, Elevation Top, Elevation Bot) -#
         self.borehole_projection = nn.Linear(3, embed_dim)
-        self.borehole_pos_encoding = PositionalEncoding(embed_dim, raster_size, raster_size, 1, patch_size)
+        self.borehole_pos_encoding = PositionalEncoding(embed_dim, raster_size, raster_size, bedrock_res, bedrock_res)
 
         ###--- AlphaEarth Embedding ---###
         self.ae_patch_embedding = PatchEmbedding(patch_size, 64, embed_dim)
-        self.ae_pos_encoding = PositionalEncoding(embed_dim, self.H, self.W, patch_size, patch_size)
+        self.ae_pos_encoding = PositionalEncoding(embed_dim, self.H*3, self.W*3, ae_res, bedrock_res)
 
         ###--- Elevation Embedding ---###
         self.elev_patch_embedding = PatchEmbedding(patch_size, 1, embed_dim)
-        self.elev_pos_encoding = PositionalEncoding(embed_dim, self.H, self.W, patch_size, patch_size)
+        self.elev_pos_encoding = PositionalEncoding(embed_dim, self.H*3, self.W*3, elev_res, bedrock_res)
 
         ###--- Transformer Architecture ---###
         self.encoder_blocks = nn.ModuleList([

@@ -3,6 +3,8 @@ import torch
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from torch.utils.data import Dataset
 import os
+import warnings
+warnings.simplefilter("error", RuntimeWarning)
 
 class CountySource:
     def __init__(self, path, order, btype='paleozoic'):
@@ -49,13 +51,16 @@ class CountySource:
 
     def get_patches(self, raster_size):
         if self._patches is None:
-            valid_mask = np.zeros(self.elevation.shape, dtype=bool)
+            valid_mask = np.zeros(next(iter(self.rasters.values()))['shape'], dtype=bool)
             for sparse in self.rasters.values():
                 valid_mask[sparse['rows'], sparse['cols']] = True
+            
             self._patches = find_valid_patches(valid_mask, raster_size, raster_size)
         return self._patches
 
     def _load_rasters(self):
+        print(f'Loading rasters for {self.path}...')
+    
         rasters = {}
         for formation in self.order:
             top_path = os.path.join(self.path, f'{formation}_top.npy')
@@ -69,13 +74,20 @@ class CountySource:
                 rasters[f'{formation}_base'] = to_sparse(np.load(base_path))
 
         self._rasters = rasters
+        
+        print(f'    rasters loaded')
+        
         self._elevation = np.load(os.path.join(self.path, 'elevation.npy'))
+
+        print(f'   elevation loaded')
 
         if self.btype == 'precambrian':
             self._magnetic = np.load(os.path.join(self.path, 'magnetic.npy'))
             self._gravity = np.load(os.path.join(self.path, 'gravity.npy'))
 
         self._alphaearth = np.load(os.path.join(self.path, 'alphaearth_2023.npy'))
+        
+        print(f'    alphaearth loaded')
 
     def is_loaded(self):
         return self._rasters is not None
@@ -214,20 +226,20 @@ class MultiCountyDataset(Dataset):
         top_rasters = top_rasters[present]
         base_rasters = base_rasters[present]
 
+        top_mean = np.nanmean(top_rasters[-1])
+        base_mean = np.nanmean(base_rasters[-1])
+        
+        top_rasters[-1] = np.where(np.isnan(top_rasters[-1]), top_mean, top_rasters[-1])
+        base_rasters[-1] = np.where(np.isnan(base_rasters[-1]), base_mean, base_rasters[-1])
+
         ###--- Fill NaNs using next valid (deeper) formation ---###
         for i in range(len(top_rasters) - 1):
-            nan_mask = np.isnan(top_rasters[i])
-            if not nan_mask.any():
-                continue
             for j in range(i + 1, len(top_rasters)):
-                still_nan = nan_mask & np.isnan(top_rasters[i])
+                still_nan = np.isnan(top_rasters[i])
                 if not still_nan.any():
                     break
                 top_rasters[i] = np.where(still_nan, top_rasters[j], top_rasters[i])
                 base_rasters[i] = np.where(still_nan, top_rasters[j], base_rasters[i])
-
-        top_rasters[-1] = np.nan_to_num(np.nanmean(top_rasters[-1]))
-        base_rasters[-1] = np.nan_to_num(np.nanmean(top_rasters[-1]))
 
         top_rasters = scaler.transform(top_rasters.reshape(-1, 1)).reshape(top_rasters.shape)
         base_rasters = scaler.transform(base_rasters.reshape(-1, 1)).reshape(base_rasters.shape)
@@ -235,7 +247,8 @@ class MultiCountyDataset(Dataset):
         top_rasters = torch.from_numpy(top_rasters).unsqueeze(1)
         base_rasters = torch.from_numpy(base_rasters).unsqueeze(1)
 
-        elevation = county.elevation[x:x + self.size, y:y + self.size]
+        elevation = county.elevation[x * 3:(x + self.size) * 3, y * 3:(y + self.size) * 3]
+        elevation = np.where(np.isnan(elevation), np.nanmean(elevation), elevation)
         elevation = scaler.transform(elevation.reshape(-1, 1)).reshape(elevation.shape)
         elevation = (
             torch.from_numpy(elevation)
@@ -244,7 +257,7 @@ class MultiCountyDataset(Dataset):
             .unsqueeze(1)
         )
 
-        alphaearth = county.alphaearth[:, x:x + self.size, y:y + self.size]
+        alphaearth = county.alphaearth[:, x*3:(x + self.size)*3, y*3:(y + self.size)*3]
         alphaearth = (
             torch.from_numpy(alphaearth)
             .unsqueeze(0)
@@ -316,9 +329,12 @@ class MultiCountyDataset(Dataset):
         self.indices = indices[:self.count]
 
     def _build_patch_lists(self):
+        print('Building patch lists')
+    
         patch_lists = []
 
         for county in self.counties:
+            print(f'    {county.path}')
             patches = county.get_patches(self.size)
             patch_lists.append(patches)
 
@@ -326,6 +342,8 @@ class MultiCountyDataset(Dataset):
         self._build_weights_from_patches(patch_lists)
 
     def _build_weights_from_patches(self, patch_lists):
+        print('Building weights')
+    
         sizes = np.array([len(p) for p in patch_lists], dtype=float)
         sizes = np.maximum(sizes, 1.0)
         log_sizes = np.log(sizes) / self.temperature
@@ -334,6 +352,8 @@ class MultiCountyDataset(Dataset):
         self._county_weights = weights / weights.sum()
 
     def split_test(self, frac=0.1, seed=42):
+        print('Splitting data')
+    
         if self._county_patches is None:
             self._build_patch_lists()
 
