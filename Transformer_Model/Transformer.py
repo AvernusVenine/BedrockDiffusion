@@ -95,13 +95,12 @@ class TransformerBlock(nn.Module):
 
 
 class BedrockTransformer(nn.Module):
-    def __init__(self, raster_size, patch_size, mag_patch_size, embed_dim, num_heads, encoder_depth, decoder_depth, mlp_dim):
+    def __init__(self, raster_size, patch_size, embed_dim, num_heads, encoder_depth, decoder_depth, mlp_dim):
         super().__init__()
 
         bedrock_res = 30
         ae_res = 30
         elev_res = 30
-        mag_res = 100
 
         self.embed_dim = embed_dim
         self.raster_size = raster_size
@@ -183,7 +182,7 @@ class BedrockTransformer(nn.Module):
         elev_queries = queries
         for block in self.elev_decoder_blocks:
             elev_queries = block(elev_queries, encoder_input)
-        elev_queries = elev_queries.permute(0, 2, 1).reshape(B, self.embed_dim, self.H, self.W)
+        elev_queries = elev_queries.permute(0, 2, 1).reshape(B, self.embed_dim, self.raster_size, self.raster_size)
 
         elev_out = self.elev_upsample(elev_queries)
         elev_out = self.elev_refine(elev_out)

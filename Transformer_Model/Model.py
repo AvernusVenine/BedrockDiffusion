@@ -26,14 +26,11 @@ class BoreholeScheduler:
     
         return int(self.rng.integers(current_min, current_max + 1))
 
-def prepare_batch(elevation, top_rasters, base_rasters, alphaearth, magnetic, formation_info, dataset, bh_count, device):
+def prepare_batch(elevation, top_rasters, base_rasters, alphaearth, dataset, bh_count, device):
     B, F, _, H, W = elevation.shape
 
     elevation = elevation[:, 0].unsqueeze(1).expand(B, F, 1, H, W).reshape(B*F, 1, H, W)
     alphaearth = alphaearth[:, 0].unsqueeze(1).expand(B, F, 64, H, W).reshape(B*F, 64, H, W)
-    magnetic = magnetic[:, 0].unsqueeze(1).expand(B, F, 5, H, W).reshape(B*F, 5, H, W)
-    formation_info = formation_info[:, 0].unsqueeze(1).expand(B, F, FormationInfo.FORMATION_INFO_DIM, H, W).reshape(
-    B*F, FormationInfo.FORMATION_INFO_DIM, H, W)
 
     B, F, _, H, W = top_rasters.shape
 
@@ -48,12 +45,11 @@ def prepare_batch(elevation, top_rasters, base_rasters, alphaearth, magnetic, fo
 
     elevation = elevation.to(device, dtype=torch.bfloat16)
     alphaearth = alphaearth.to(device, dtype=torch.bfloat16)
-    magnetic = magnetic.to(device, dtype=torch.bfloat16)
     existence = existence.to(device, dtype=torch.bfloat16)
     top_rasters = top_rasters.to(device, dtype=torch.bfloat16)
     boreholes = boreholes.to(device, dtype=torch.bfloat16)
 
-    return elevation, top_rasters, existence, alphaearth, magnetic, formation_info, boreholes
+    return elevation, top_rasters, existence, alphaearth, boreholes
 
 def test(data_path, model_path, save_path):
     raster_size = 64
@@ -129,9 +125,8 @@ def test(data_path, model_path, save_path):
     plt.close()
 
 def train(data_path, save_path, lr=1e-4, max_epochs=100):
-    raster_size = 80
+    raster_size = 64
     patch_size = 16
-    mag_patch_size = 8
     embed_dim = 512
     mlp_dim = 1024
     data_count = 3000
@@ -178,14 +173,13 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
 
     print('Constructing Model...')
 
-    bh_scheduler = BoreholeScheduler([20, 100], [1, 20], 50)
+    bh_scheduler = BoreholeScheduler([50, 200], [1, 25], 50)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     model = BedrockTransformer(
         raster_size,
         patch_size,
-        mag_patch_size,
         embed_dim,
         num_heads=8,
         encoder_depth=encoder_depth,
@@ -194,9 +188,9 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
     ).to(device)
     print(' constructed TERRA')
     
-    #model = torch.compile(model)
+    model = torch.compile(model)
     
-    #print(' compiled TERRA')
+    print(' compiled TERRA')
 
     optimizer = torch.optim.AdamW(
         list(model.parameters()),
@@ -219,11 +213,11 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
         train_loss = 0.0
         train_dataset.generate_indices()
 
-        for elevation, top_rasters, base_rasters, alphaearth, magnetic, formation_info in train_loader:
+        for elevation, top_rasters, base_rasters, alphaearth in train_loader:
             count = bh_scheduler.sample(epoch)
 
-            elevation, top_rasters, existence, alphaearth, magnetic, formation_info, boreholes = prepare_batch(
-                elevation, top_rasters, base_rasters, alphaearth, magnetic, formation_info, train_dataset, count, device)
+            elevation, top_rasters, existence, alphaearth, boreholes = prepare_batch(
+                elevation, top_rasters, base_rasters, alphaearth, train_dataset, count, device)
 
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 predicted_elevation = model(elevation, boreholes, alphaearth)
@@ -248,12 +242,11 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
         test_loss = 0.0
 
         with torch.no_grad():
-            for elevation, top_rasters, base_rasters, alphaearth, magnetic, formation_info in test_loader:
+            for elevation, top_rasters, base_rasters, alphaearth in test_loader:
                 count = bh_scheduler.sample(epoch)
 
-                elevation, top_rasters, existence, alphaearth, magnetic, formation_info, boreholes = prepare_batch(
-                    elevation, top_rasters, base_rasters, alphaearth, magnetic, formation_info, train_dataset, count,
-                    device)
+                elevation, top_rasters, existence, alphaearth, boreholes = prepare_batch(
+                    elevation, top_rasters, base_rasters, alphaearth, train_dataset, count, device)
 
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                     predicted_elevation = model(elevation, boreholes, alphaearth)
