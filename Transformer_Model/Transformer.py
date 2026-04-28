@@ -1,12 +1,9 @@
 import math
 import torch
 import torch.nn as nn
+from Transformer_Model import FormationInfo
 
 class PatchEmbedding(nn.Module):
-    """
-    IN:  (B x C x N x N)
-    OUT: (B x (N/patch_size)**2 x embed_dim)
-    """
     def __init__(self, patch_size, in_channels, embed_dim):
         super().__init__()
         self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
@@ -98,22 +95,22 @@ class TransformerBlock(nn.Module):
 
 
 class BedrockTransformer(nn.Module):
-    def __init__(self, raster_size, patch_size, embed_dim, num_heads, encoder_depth, decoder_depth, mlp_dim):
+    def __init__(self, raster_size, patch_size, mag_patch_size, embed_dim, num_heads, encoder_depth, decoder_depth, mlp_dim):
         super().__init__()
 
         bedrock_res = 30
-        ae_res = 10
-        elev_res = 10
+        ae_res = 30
+        elev_res = 30
+        mag_res = 100
 
         self.embed_dim = embed_dim
-        self.H = int(raster_size // patch_size)
-        self.W = int(raster_size // patch_size)
+        self.raster_size = raster_size
 
         ###--- Bedrock Queries ---###
         self.bedrock_query_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         nn.init.trunc_normal_(self.bedrock_query_token, std=0.02)
 
-        self.query_pos_encoding = PositionalEncoding(embed_dim, self.H, self.W, bedrock_res, bedrock_res)
+        self.query_pos_encoding = PositionalEncoding(embed_dim, raster_size, raster_size, bedrock_res, bedrock_res)
 
         ###--- Borehole Embedding ---###
         #- (Existence, Elevation Top, Elevation Bot) -#
@@ -122,11 +119,18 @@ class BedrockTransformer(nn.Module):
 
         ###--- AlphaEarth Embedding ---###
         self.ae_patch_embedding = PatchEmbedding(patch_size, 64, embed_dim)
-        self.ae_pos_encoding = PositionalEncoding(embed_dim, self.H*3, self.W*3, ae_res, bedrock_res)
+        self.ae_pos_encoding = PositionalEncoding(embed_dim, raster_size, raster_size, ae_res, bedrock_res)
 
         ###--- Elevation Embedding ---###
         self.elev_patch_embedding = PatchEmbedding(patch_size, 1, embed_dim)
-        self.elev_pos_encoding = PositionalEncoding(embed_dim, self.H*3, self.W*3, elev_res, bedrock_res)
+        self.elev_pos_encoding = PositionalEncoding(embed_dim, raster_size, raster_size, elev_res, bedrock_res)
+
+        ###--- Magnetic Embedding ---###
+        self.mag_patch_embedding = PatchEmbedding(mag_patch_size, 5, embed_dim)
+        self.mag_pos_encoding = PositionalEncoding(embed_dim, int(3*raster_size/10), int(3*raster_size/10), mag_res, bedrock_res)
+
+        ###--- Formation Composition Embedding ---###
+        self.formation_projection = nn.Linear(FormationInfo.FORMATION_INFO_DIM, embed_dim)
 
         ###--- Transformer Architecture ---###
         self.encoder_blocks = nn.ModuleList([
@@ -137,7 +141,9 @@ class BedrockTransformer(nn.Module):
         ])
 
         ###--- Bedrock Surface Elevation Head ---###
-        self.elev_decoder = TransformerCrossBlock(embed_dim, num_heads, mlp_dim)
+        self.elev_decoder_blocks = nn.ModuleList([
+            TransformerCrossBlock(embed_dim, num_heads, mlp_dim) for _ in range(decoder_depth)
+        ])
         self.elev_upsample = nn.Sequential(
             nn.Upsample(scale_factor=patch_size, mode='bilinear', align_corners=False),
             nn.Conv2d(embed_dim, 1, kernel_size=3, padding=1)
@@ -153,7 +159,9 @@ class BedrockTransformer(nn.Module):
         )
 
         ###--- Bedrock Existence Head ---###
-        self.exist_decoder = TransformerCrossBlock(embed_dim, num_heads, mlp_dim)
+        self.exist_decoder_blocks = nn.ModuleList([
+            TransformerCrossBlock(embed_dim, num_heads, mlp_dim) for _ in range(decoder_depth)
+        ])
         self.exist_upsample = nn.Sequential(
             nn.Upsample(scale_factor=patch_size, mode='bilinear', align_corners=False),
             nn.Conv2d(embed_dim, 1, kernel_size=3, padding=1)
@@ -173,7 +181,7 @@ class BedrockTransformer(nn.Module):
             return tokens
         return tokens[~mask].reshape(B, -1, self.embed_dim)
 
-    def forward(self, elev, bh, ae, elev_mask=None, ae_mask=None):
+    def forward(self, elev, bh, ae, mag, fc):
         B, D = elev.shape[0], self.embed_dim
 
         ###--- Embed inputs and apply positional encodings ---###
@@ -186,33 +194,34 @@ class BedrockTransformer(nn.Module):
         ae = self.ae_patch_embedding(ae)
         ae = self.ae_pos_encoding(ae)
 
-        ###--- Apply masks if in pretraining ---###
-        elev = self.apply_mask(elev, B, elev_mask)
-        ae = self.apply_mask(ae, B, ae_mask)
+        mag = self.mag_patch_embedding(mag)
+        mag = self.mag_pos_encoding(mag)
+
+        fc = self.formation_projection(fc)
 
         ###--- Encoder Blocks ---###
-        encoder_input = torch.concatenate([elev, ae, bh], dim=1)
+        encoder_input = torch.concatenate([elev, ae, bh, mag, fc], dim=1)
 
         for block in self.encoder_blocks:
             encoder_input = block(encoder_input)
 
         ###--- Bedrock Elevation Query Tokens ---###
-        queries = self.bedrock_query_token.expand(B, self.H * self.W, self.embed_dim)
+        queries = self.bedrock_query_token.expand(B, self.raster_size**2, self.embed_dim)
         queries = self.query_pos_encoding(queries)
 
-        ###--- Decoder Blocks ---###
-        for block in self.decoder_blocks:
-            queries = block(queries, encoder_input)
-
         ###--- Bedrock Surface Elevation Head ---###
-        elev_queries = self.elev_decoder(queries, encoder_input)
+        elev_queries = queries
+        for block in self.elev_decoder_blocks:
+            elev_queries = block(elev_queries, encoder_input)
         elev_queries = elev_queries.permute(0, 2, 1).reshape(B, self.embed_dim, self.H, self.W)
 
         elev_out = self.elev_upsample(elev_queries)
         elev_out = self.elev_refine(elev_out)
 
         ###--- Existence Head ---###
-        exist_queries = self.exist_decoder(queries, encoder_input)
+        exist_queries = queries
+        for block in self.exist_decoder_blocks:
+            exist_queries = block(exist_queries, encoder_input)
         exist_queries = exist_queries.permute(0, 2, 1).reshape(B, self.embed_dim, self.H, self.W)
 
         exist_out = self.exist_upsample(exist_queries)

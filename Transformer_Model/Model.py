@@ -1,39 +1,13 @@
 import numpy as np
 import Data
 from Transformer_Model.Transformer import BedrockTransformer
+from Transformer_Model import FormationInfo
 import torch
 import torch.nn.functional as F
 from torch.utils.data import random_split, DataLoader
 import pandas as pd
 import joblib
 import matplotlib.pyplot as plt
-
-class MaskScheduler:
-    def __init__(self, num_tokens, pretrain_epochs, min_ratio, max_ratio):
-        self.num_tokens = num_tokens
-        self.pretrain_epochs = pretrain_epochs
-        self.min_ratio = min_ratio
-        self.max_ratio = max_ratio
-        self.rng = np.random.default_rng()
-
-    def _sample_mask(self, B, device):
-        ratio = self.rng.uniform(self.min_ratio, self.max_ratio)
-        num_masked = int(round(self.num_tokens * ratio))
-
-        mask = torch.zeros(B, self.num_tokens, dtype=torch.bool, device=device)
-        for i in range(B):
-            idx = torch.randperm(self.num_tokens, device=device)[:num_masked]
-            mask[i, idx] = True
-        return mask
-
-    def sample(self, epoch, B, device):
-        if epoch >= self.pretrain_epochs:
-            return None, None
-
-        elev_mask = self._sample_mask(B, device)
-        ae_mask = self._sample_mask(B, device)
-        return elev_mask, ae_mask
-
 
 class BoreholeScheduler:
     def __init__(self, max_count_range, min_count_range, warmup_epochs):
@@ -45,17 +19,21 @@ class BoreholeScheduler:
 
     def sample(self, epoch):
         t = min(epoch / self.warmup_epochs, 1.0)
-
+    
         current_max = int(round(self.max_hi - t * (self.max_hi - self.max_lo)))
         current_min = int(round(self.min_hi - t * (self.min_hi - self.min_lo)))
-
+        current_min = min(current_min, current_max - 1)
+    
         return int(self.rng.integers(current_min, current_max + 1))
 
-def prepare_batch(elevation, top_rasters, base_rasters, alphaearth, dataset, bh_count, device):
+def prepare_batch(elevation, top_rasters, base_rasters, alphaearth, magnetic, formation_info, dataset, bh_count, device):
     B, F, _, H, W = elevation.shape
 
     elevation = elevation[:, 0].unsqueeze(1).expand(B, F, 1, H, W).reshape(B*F, 1, H, W)
     alphaearth = alphaearth[:, 0].unsqueeze(1).expand(B, F, 64, H, W).reshape(B*F, 64, H, W)
+    magnetic = magnetic[:, 0].unsqueeze(1).expand(B, F, 5, H, W).reshape(B*F, 5, H, W)
+    formation_info = formation_info[:, 0].unsqueeze(1).expand(B, F, FormationInfo.FORMATION_INFO_DIM, H, W).reshape(
+    B*F, FormationInfo.FORMATION_INFO_DIM, H, W)
 
     B, F, _, H, W = top_rasters.shape
 
@@ -70,11 +48,12 @@ def prepare_batch(elevation, top_rasters, base_rasters, alphaearth, dataset, bh_
 
     elevation = elevation.to(device, dtype=torch.bfloat16)
     alphaearth = alphaearth.to(device, dtype=torch.bfloat16)
+    magnetic = magnetic.to(device, dtype=torch.bfloat16)
     existence = existence.to(device, dtype=torch.bfloat16)
     top_rasters = top_rasters.to(device, dtype=torch.bfloat16)
     boreholes = boreholes.to(device, dtype=torch.bfloat16)
 
-    return elevation, top_rasters, existence, alphaearth, boreholes
+    return elevation, top_rasters, existence, alphaearth, magnetic, formation_info, boreholes
 
 def test(data_path, model_path, save_path):
     raster_size = 64
@@ -150,13 +129,14 @@ def test(data_path, model_path, save_path):
     plt.close()
 
 def train(data_path, save_path, lr=1e-4, max_epochs=100):
-    raster_size = 64
+    raster_size = 80
     patch_size = 16
+    mag_patch_size = 8
     embed_dim = 512
     mlp_dim = 1024
-    data_count = 5000
+    data_count = 3000
     encoder_depth = 6
-    decoder_depth = 3
+    decoder_depth = 4
 
     # =============================
     # DATA PREPROCESSING
@@ -164,8 +144,10 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
 
     print('Loading Rasters')
 
-    formations = ['kwnd', 'dlp', 'dspl', 'omaq', 'odub', 'ogsv', 'ogpr', 'ogcm', 'odcr', 'opgw', 'ostp', 'opsh', 'opod',
-                 'cp', 'cjdn', 'cstl', 'ctcg', 'cwoc', 'cecr', 'cmts']
+    formations = [
+        'kwnd', 'dlp', 'dspl', 'omaq', 'odub', 'ogsv', 'ogpr', 'ogcm', 'odcr', 'opgw', 'ostp', 'opsh', 'opod',
+        'cp', 'cjdn', 'cstl', 'ctcg', 'cwoc', 'cecr', 'cmts'
+    ]
 
     counties = [Data.CountySource(p, formations) for p in data_path]
 
@@ -182,11 +164,13 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
 
     dataset = Data.MultiCountyDataset(counties, scaler_dict, data_count, raster_size, 2.0)
 
-    test_dataset = dataset.split_test()
+    test_dataset = dataset.split_test(int(data_count * 0.1))
     train_dataset = dataset
 
-    train_loader = DataLoader(train_dataset, batch_size=6, shuffle=True, num_workers=4, pin_memory=True, persistent_workers=True)
-    test_loader = DataLoader(test_dataset, batch_size=6, shuffle=False, num_workers=4, pin_memory=True, persistent_workers=True)
+    train_loader = DataLoader(train_dataset, batch_size=6, num_workers=0)
+    test_loader = DataLoader(test_dataset, batch_size=6, num_workers=0)
+
+    test_dataset.generate_indices()
 
     # =============================
     # MODEL CONSTRUCTION
@@ -194,25 +178,25 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
 
     print('Constructing Model...')
 
-    bh_scheduler = BoreholeScheduler([10, 100], [1, 50], 30)
-
-    num_tokens = (raster_size // patch_size) ** 2
-    mask_scheduler = MaskScheduler(num_tokens, 30, .5, .5)
+    bh_scheduler = BoreholeScheduler([20, 100], [1, 20], 50)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     model = BedrockTransformer(
         raster_size,
         patch_size,
+        mag_patch_size,
         embed_dim,
         num_heads=8,
         encoder_depth=encoder_depth,
         decoder_depth=decoder_depth,
         mlp_dim=mlp_dim,
     ).to(device)
-    model = torch.compile(model)
+    print(' constructed TERRA')
     
-    print(' compiled TERRA')
+    #model = torch.compile(model)
+    
+    #print(' compiled TERRA')
 
     optimizer = torch.optim.AdamW(
         list(model.parameters()),
@@ -235,34 +219,14 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
         train_loss = 0.0
         train_dataset.generate_indices()
 
-        for elevation, top_rasters, base_rasters, alphaearth in train_loader:
+        for elevation, top_rasters, base_rasters, alphaearth, magnetic, formation_info in train_loader:
             count = bh_scheduler.sample(epoch)
 
-            elevation, top_rasters, existence, alphaearth, boreholes = prepare_batch(elevation, top_rasters,
-                    base_rasters, alphaearth, train_dataset, count, device)
+            elevation, top_rasters, existence, alphaearth, magnetic, formation_info, boreholes = prepare_batch(
+                elevation, top_rasters, base_rasters, alphaearth, magnetic, formation_info, train_dataset, count, device)
 
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                elev_mask, ae_mask = mask_scheduler.sample(epoch, elevation.shape[0], device)
-
-                if any(torch.isnan(t).any() for t in [elevation, top_rasters, existence, alphaearth, boreholes]):
-                    bad_data = {
-                        name: t.cpu().float().numpy()
-                        for name, t in [
-                            ('elevation', elevation),
-                            ('top_rasters', top_rasters),
-                            ('existence', existence),
-                            ('alphaearth', alphaearth),
-                            ('boreholes', boreholes),
-                        ]
-                    }
-                    for name, arr in bad_data.items():
-                        n = np.isnan(arr).sum()
-                        if n > 0:
-                            print(f'  {name}: {n} NaNs out of {arr.size} values, shape={arr.shape}')
-                    np.savez(f'{save_path}_bad_batch_{epoch}.npz', **bad_data)
-                    continue
-
-                predicted_elevation, predicted_existence = model(elevation, boreholes, alphaearth, elev_mask, ae_mask)
+                predicted_elevation, predicted_existence = model(elevation, boreholes, alphaearth, magnetic, formation_info)
 
                 elevation_loss = F.mse_loss(predicted_elevation, top_rasters)
                 existence_loss = F.binary_cross_entropy_with_logits(predicted_existence, existence)
@@ -282,27 +246,20 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
         # =============================
         # TEST LOOP
         # =============================
-
+        
         model.eval()
-
         test_loss = 0.0
-        test_dataset.generate_indices()
 
         with torch.no_grad():
-            for elevation, top_rasters, base_rasters, alphaearth in test_loader:
+            for elevation, top_rasters, base_rasters, alphaearth, magnetic, formation_info in test_loader:
                 count = bh_scheduler.sample(epoch)
 
-                elevation, top_rasters, existence, alphaearth, boreholes = prepare_batch(elevation, top_rasters,
-                        base_rasters, alphaearth, test_dataset, count, device)
-                
-                if any(torch.isnan(t).any() for t in [elevation, top_rasters, existence, alphaearth, boreholes]):
-                    print('Test NaN Encountered for some reason')
-                    continue
+                elevation, top_rasters, existence, alphaearth, magnetic, formation_info, boreholes = prepare_batch(
+                    elevation, top_rasters, base_rasters, alphaearth, magnetic, formation_info, train_dataset, count,
+                    device)
 
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                    elev_mask, ae_mask = mask_scheduler.sample(epoch, elevation.shape[0], device)
-
-                    predicted_elevation, predicted_existence = model(elevation, boreholes, alphaearth, elev_mask, ae_mask)
+                    predicted_elevation, predicted_existence = model(elevation, boreholes, alphaearth, magnetic, formation_info)
 
                     elevation_loss = F.mse_loss(predicted_elevation, top_rasters)
                     existence_loss = F.binary_cross_entropy_with_logits(predicted_existence, existence)
@@ -313,14 +270,16 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
 
         print(f'Test Loss: {test_loss / len(test_loader)}')
         loss_dict['test'].append(test_loss / len(test_loader))
+        
 
         pd.DataFrame(loss_dict).to_csv(f'{save_path}_loss.csv')
 
-        if epoch == 99:
+        if epoch == 49:
+            print('Pretraining completed')
             torch.save(
                 {
                     'epoch': epoch + 1,
-                    'model': model._orig_mod.state_dict(),
+                    'model': model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'loss': test_loss,
                     'raster_size': raster_size,
@@ -339,7 +298,7 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
             torch.save(
                 {
                     'epoch': epoch + 1,
-                    'model': model._orig_mod.state_dict(),
+                    'model': model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'loss': best_loss,
                     'raster_size': raster_size,

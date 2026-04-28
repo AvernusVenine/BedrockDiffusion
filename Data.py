@@ -1,9 +1,11 @@
 import numpy as np
 import torch
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 import os
 import warnings
+from Transformer_Model import FormationInfo
+
 warnings.simplefilter("error", RuntimeWarning)
 
 class CountySource:
@@ -15,7 +17,12 @@ class CountySource:
         self._rasters = None
         self._elevation = None
         self._magnetic = None
+        self._magnetic_fvd = None
+        self._magnetic_svd = None
+        self._magnetic_tlt = None
+        self._magnetic_ana = None
         self._gravity = None
+        self._gravity_svd = None
         self._alphaearth = None
         self._patches = None
 
@@ -38,10 +45,40 @@ class CountySource:
         return self._magnetic
 
     @property
+    def magnetic_fvd(self):
+        if self._magnetic_fvd is None:
+            self._load_rasters()
+        return self._magnetic_fvd
+
+    @property
+    def magnetic_svd(self):
+        if self._magnetic_svd is None:
+            self._load_rasters()
+        return self._magnetic_svd
+
+    @property
+    def magnetic_tlt(self):
+        if self._magnetic_tlt is None:
+            self._load_rasters()
+        return self._magnetic_tlt
+
+    @property
+    def magnetic_ana(self):
+        if self._magnetic_ana is None:
+            self._load_rasters()
+        return self._magnetic_ana
+
+    @property
     def gravity(self):
         if self._gravity is None:
             self._load_rasters()
         return self._gravity
+
+    @property
+    def gravity_svd(self):
+        if self._gravity_svd is None:
+            self._load_rasters()
+        return self._gravity_svd
 
     @property
     def alphaearth(self):
@@ -56,11 +93,16 @@ class CountySource:
                 valid_mask[sparse['rows'], sparse['cols']] = True
             
             self._patches = find_valid_patches(valid_mask, raster_size, raster_size)
+
         return self._patches
 
     def _load_rasters(self):
-        print(f'Loading rasters for {self.path}...')
-    
+        print(f'Loading rasters for {self.path} with type {self.btype}...')
+
+        depth_to_bdrk = None
+        if self.btype == 'precambrian':
+            depth_to_bdrk = np.load(os.path.join(self.path, f'depth_to_bdrk.npy'))
+
         rasters = {}
         for formation in self.order:
             top_path = os.path.join(self.path, f'{formation}_top.npy')
@@ -68,10 +110,23 @@ class CountySource:
             if not os.path.isfile(top_path):
                 continue
 
-            rasters[f'{formation}_top'] = to_sparse(np.load(top_path))
             if self.btype == 'paleozoic':
+                rasters[f'{formation}_top'] = to_sparse(np.load(top_path))
+
                 base_path = os.path.join(self.path, f'{formation}_base.npy')
                 rasters[f'{formation}_base'] = to_sparse(np.load(base_path))
+
+            #- Need to artificially create the base layer of the precambrian as MGS does not interpolate it -#
+            if self.btype == 'precambrian':
+                existence = ~np.isnan(np.load(top_path))
+
+                offset = np.random.uniform(100, 500, size=depth_to_bdrk.shape)
+
+                base = np.copy(depth_to_bdrk)
+                base[existence] = base[existence] - offset[existence]
+
+                rasters[f'{formation}_top'] = to_sparse(depth_to_bdrk)
+                rasters[f'{formation}_base'] = to_sparse(base)
 
         self._rasters = rasters
         
@@ -79,11 +134,17 @@ class CountySource:
         
         self._elevation = np.load(os.path.join(self.path, 'elevation.npy'))
 
-        print(f'   elevation loaded')
+        print(f'    elevation loaded')
 
-        if self.btype == 'precambrian':
-            self._magnetic = np.load(os.path.join(self.path, 'magnetic.npy'))
-            self._gravity = np.load(os.path.join(self.path, 'gravity.npy'))
+        self._magnetic = np.load(os.path.join(self.path, 'magnetic.npy'))
+        self._magnetic_fvd = np.load(os.path.join(self.path, 'magnetic_fvd.npy'))
+        self._magnetic_svd = np.load(os.path.join(self.path, 'magnetic_svd.npy'))
+        self._magnetic_tlt = np.load(os.path.join(self.path, 'magnetic_tlt.npy'))
+        self._magnetic_ana = np.load(os.path.join(self.path, 'magnetic_ana.npy'))
+        #self._gravity = np.load(os.path.join(self.path, 'gravity.npy'))
+        #self._gravity_svd = np.load(os.path.join(self.path, 'gravity_svd.npy'))
+
+        print(f'    geophysical loaded')
 
         self._alphaearth = np.load(os.path.join(self.path, 'alphaearth_2023.npy'))
         
@@ -92,14 +153,23 @@ class CountySource:
     def is_loaded(self):
         return self._rasters is not None
 
-    def unload(self):
-        self._rasters = None
-        self._elevation = None
-        self._alphaearth = None
-        self._patches = None
+class PatchSampler(Sampler):
+    """Sampler that yields (county_idx, patch_idx) tuples from the dataset's
+    pre-generated index list.  Because the sampler runs in the **main process**,
+    it always sees the latest indices even with persistent DataLoader workers."""
+
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __iter__(self):
+        yield from self.dataset.indices
+
+    def __len__(self):
+        return len(self.dataset.indices)
+
 
 class MultiCountyDataset(Dataset):
-    def __init__(self, counties, scaler_dict, count, raster_size, temperature=2.0, btype='paleozoic'):
+    def __init__(self, counties, scaler_dict, count, raster_size, btype='paleozoic', temperature=2.0):
         self.counties = counties
         self.scaler_dict = scaler_dict
         self.count = count
@@ -116,10 +186,10 @@ class MultiCountyDataset(Dataset):
         return self.count
 
     def get_full(self, idx):
-        if self.indices is None:
-            self.generate_indices()
-
-        county_idx, patch_idx = self.indices[idx]
+        if isinstance(idx, tuple):
+            county_idx, patch_idx = idx
+        else:
+            county_idx, patch_idx = self.indices[idx]
         county = self.counties[county_idx]
         patches = self._county_patches[county_idx]
         x, y = patches[patch_idx]
@@ -201,16 +271,15 @@ class MultiCountyDataset(Dataset):
         return None
 
     def __getitem__(self, idx):
-        if self.indices is None:
-            self.generate_indices()
-
-        county_idx, patch_idx = self.indices[idx]
+        if isinstance(idx, tuple):
+            county_idx, patch_idx = idx
+        else:
+            county_idx, patch_idx = self.indices[idx]
         county = self.counties[county_idx]
         patches = self._county_patches[county_idx]
         x, y = patches[patch_idx]
 
         rasters = county.rasters
-        scaler = self.scaler_dict['elevation']
 
         top_rasters = np.array([
             patch_from_sparse(s, x, y, self.size)
@@ -219,6 +288,10 @@ class MultiCountyDataset(Dataset):
         base_rasters = np.array([
             patch_from_sparse(s, x, y, self.size)
             for k, s in rasters.items() if str(k).endswith('base')
+        ])
+
+        formation_info = np.array([
+            FormationInfo.FORMATION_ENCODINGS[k.split('_')[0]] for k in rasters.keys()
         ])
 
         ###--- Drop all formations absent from patch ---###
@@ -241,15 +314,15 @@ class MultiCountyDataset(Dataset):
                 top_rasters[i] = np.where(still_nan, top_rasters[j], top_rasters[i])
                 base_rasters[i] = np.where(still_nan, top_rasters[j], base_rasters[i])
 
-        top_rasters = scaler.transform(top_rasters.reshape(-1, 1)).reshape(top_rasters.shape)
-        base_rasters = scaler.transform(base_rasters.reshape(-1, 1)).reshape(base_rasters.shape)
+        top_rasters = self.scaler_dict['elevation'].transform(top_rasters.reshape(-1, 1)).reshape(top_rasters.shape)
+        base_rasters = self.scaler_dict['elevation'].transform(base_rasters.reshape(-1, 1)).reshape(base_rasters.shape)
 
         top_rasters = torch.from_numpy(top_rasters).unsqueeze(1)
         base_rasters = torch.from_numpy(base_rasters).unsqueeze(1)
 
-        elevation = county.elevation[x * 3:(x + self.size) * 3, y * 3:(y + self.size) * 3]
+        elevation = county.elevation[x:x + self.size, y:y + self.size].astype(np.float32)
         elevation = np.where(np.isnan(elevation), np.nanmean(elevation), elevation)
-        elevation = scaler.transform(elevation.reshape(-1, 1)).reshape(elevation.shape)
+        elevation = self.scaler_dict['elevation'].transform(elevation.reshape(-1, 1)).reshape(elevation.shape)
         elevation = (
             torch.from_numpy(elevation)
             .unsqueeze(0)
@@ -257,58 +330,82 @@ class MultiCountyDataset(Dataset):
             .unsqueeze(1)
         )
 
-        alphaearth = county.alphaearth[:, x*3:(x + self.size)*3, y*3:(y + self.size)*3]
+        alphaearth = county.alphaearth[:, x:x + self.size, y:y + self.size]
         alphaearth = (
             torch.from_numpy(alphaearth)
             .unsqueeze(0)
             .repeat(top_rasters.shape[0], 1, 1, 1)
         )
 
-        ###--- Paleozoic Return Logic ---###
-        if self.btype == 'paleozoic':
-            ###--- Keep shallowest 3 and one random deeper formation ---###
+        formation_info = (
+            torch.from_numpy(formation_info)
+            .unsqueeze(1)
+        )
+
+        magnetic = county.magnetic[x:x+self.size, y:y+self.size]
+        magnetic = np.where(np.isnan(magnetic), np.nanmean(magnetic), magnetic)
+        magnetic = self.scaler_dict['magnetic'].transform(magnetic.reshape(-1, 1)).reshape(magnetic.shape)
+
+        magnetic_fvd = county.magnetic_fvd[x:x+self.size, y:y+self.size]
+        magnetic_fvd = np.where(np.isnan(magnetic_fvd), np.nanmean(magnetic_fvd), magnetic_fvd)
+        magnetic_fvd = self.scaler_dict['magnetic_fvd'].transform(magnetic_fvd.reshape(-1, 1)).reshape(magnetic_fvd.shape)
+
+        magnetic_svd = county.magnetic_svd[x:x+self.size, y:y+self.size]
+        magnetic_svd = np.where(np.isnan(magnetic_svd), np.nanmean(magnetic_svd), magnetic_svd)
+        magnetic_svd = self.scaler_dict['magnetic_svd'].transform(magnetic_svd.reshape(-1, 1)).reshape(magnetic_svd.shape)
+
+        magnetic_tlt = county.magnetic_tlt[x:x+self.size, y:y+self.size]
+        magnetic_tlt = np.where(np.isnan(magnetic_tlt), np.nanmean(magnetic_tlt), magnetic_tlt)
+        magnetic_tlt = self.scaler_dict['magnetic_tlt'].transform(magnetic_tlt.reshape(-1, 1)).reshape(magnetic_tlt.shape)
+
+        magnetic_ana = county.magnetic_ana[x:x+self.size, y:y+self.size]
+        magnetic_ana = np.where(np.isnan(magnetic_ana), np.nanmean(magnetic_ana), magnetic_ana)
+        magnetic_ana = self.scaler_dict['magnetic_ana'].transform(magnetic_ana.reshape(-1, 1)).reshape(magnetic_ana.shape)
+
+        magnetic = np.stack([magnetic, magnetic_fvd, magnetic_svd, magnetic_tlt, magnetic_ana], axis=0)
+        magnetic = torch.from_numpy(magnetic).unsqueeze(0).repeat(top_rasters.shape[0], 1, 1, 1)
+
+        ###--- Keep shallowest 3 and one random deeper formation ---###
+        if county.btype == 'paleozoic':
             if len(top_rasters) > 3:
                 rng = np.random.default_rng()
                 rand_idx = rng.integers(3, len(top_rasters))
                 sel = [0, 1, 2, rand_idx]
+
                 top_rasters = top_rasters[sel]
                 base_rasters = base_rasters[sel]
                 elevation = elevation[sel]
                 alphaearth = alphaearth[sel]
+                magnetic = magnetic[sel]
+                formation_info = formation_info[sel]
 
-            max_f = 4
-            f = top_rasters.shape[0]
+        ###--- Keep 4 random formations ---###
+        elif county.btype == 'precambrian':
+            if len(top_rasters) > 3:
+                rng = np.random.default_rng()
+                sel = rng.choice(top_rasters, 4, replace=False)
 
-            if f < max_f:
-                pad = max_f - f
+                top_rasters = top_rasters[sel]
+                base_rasters = base_rasters[sel]
+                elevation = elevation[sel]
+                alphaearth = alphaearth[sel]
+                magnetic = magnetic[sel]
+                formation_info = formation_info[sel]
 
-                top_rasters = torch.cat([top_rasters, top_rasters[-1:].expand(pad, -1, -1, -1)], dim=0)
-                base_rasters = torch.cat([base_rasters, base_rasters[-1:].expand(pad, -1, -1, -1)], dim=0)
-                elevation = torch.cat([elevation, elevation[-1:].expand(pad, -1, -1, -1)], dim=0)
-                alphaearth = torch.cat([alphaearth, alphaearth[-1:].expand(pad, -1, -1, -1)], dim=0)
+        max_f = 4
+        f = top_rasters.shape[0]
 
-            return elevation, top_rasters, base_rasters, alphaearth
+        if f < max_f:
+            pad = max_f - f
 
-        ###--- Precambrian Return Logic ---###
-        elif self.btype == 'precambrian':
-            magnetic = county.magnetic[x:x + self.size, y:y + self.size]
-            magnetic = (
-                torch.from_numpy(magnetic)
-                .unsqueeze(0)
-                .repeat(top_rasters.shape[0], 1, 1)
-                .unsqueeze(1)
-            )
-            gravity = county.gravity[x:x + self.size, y:y + self.size]
-            gravity = (
-                torch.from_numpy(gravity)
-                .unsqueeze(0)
-                .repeat(top_rasters.shape[0], 1, 1)
-                .unsqueeze(1)
-            )
+            top_rasters = torch.cat([top_rasters, top_rasters[-1:].expand(pad, -1, -1, -1)], dim=0)
+            base_rasters = torch.cat([base_rasters, base_rasters[-1:].expand(pad, -1, -1, -1)], dim=0)
+            elevation = torch.cat([elevation, elevation[-1:].expand(pad, -1, -1, -1)], dim=0)
+            alphaearth = torch.cat([alphaearth, alphaearth[-1:].expand(pad, -1, -1, -1)], dim=0)
+            magnetic = torch.cat([magnetic, magnetic[-1:].expand(pad, -1, -1, -1)], dim=0)
+            formation_info = torch.cat([formation_info, formation_info[-1:].expand(pad, -1, -1, -1)], dim=0)
 
-            return elevation, top_rasters, alphaearth, magnetic, gravity
-
-        return None
+        return elevation, top_rasters, base_rasters, alphaearth, magnetic, formation_info
 
     def generate_indices(self):
         if self._county_patches is None:
@@ -351,7 +448,7 @@ class MultiCountyDataset(Dataset):
         weights = np.exp(log_sizes)
         self._county_weights = weights / weights.sum()
 
-    def split_test(self, frac=0.1, seed=42):
+    def split_test(self, count, frac=0.05, seed=42):
         print('Splitting data')
     
         if self._county_patches is None:
@@ -371,11 +468,12 @@ class MultiCountyDataset(Dataset):
             train_patch_lists.append([p for i, p in enumerate(patches) if i not in chosen_set])
 
         test_count = sum(len(p) for p in test_patch_lists)
+        print(test_count)
 
         test_dataset = MultiCountyDataset(
             self.counties,
             self.scaler_dict,
-            count=test_count,
+            count=count,
             raster_size=self.size,
             temperature=self.temperature,
         )
@@ -433,7 +531,9 @@ def find_valid_patches(mask, N, M):
     invalid_counts = bottom_right - top - left + top_left
     rows, cols = np.where(invalid_counts == 0)
 
-    return list(zip(rows.tolist(), cols.tolist()))
+    mask_snap = (rows % 10 == 0) & (cols % 10 == 0)
+
+    return list(zip(rows[mask_snap].tolist(), cols[mask_snap].tolist()))
 
 def to_sparse(arr):
     rows, cols = np.where(~np.isnan(arr))
@@ -471,26 +571,11 @@ def load_rasters(path, order=None):
 
     return rasters, context
 
-def create_scaler_dict(rasters, context):
-    scaler_dict = {}
-
-    all_values = np.concatenate(
-        [s['values'] for s in rasters.values()] + [context['elevation'].reshape(-1)]
-    ).reshape(-1, 1)
-
-    elevation_scaler = StandardScaler()
-    elevation_scaler.fit(all_values)
-    scaler_dict['elevation'] = elevation_scaler
-
-    borehole_scaler = MinMaxScaler()
-    borehole_scaler.fit(np.array([-500, 1500]).reshape(-1, 1))
-    scaler_dict['borehole'] = borehole_scaler
-
-    return scaler_dict
-
 def create_global_scaler_dict(counties):
     rng = np.random.default_rng(0)
     sampled_values = []
+
+    scaler_dict = {}
 
     for county in counties:
         county_values = np.concatenate(
@@ -506,5 +591,86 @@ def create_global_scaler_dict(counties):
 
     elevation_scaler = StandardScaler()
     elevation_scaler.fit(all_values)
+    scaler_dict['elevation'] = elevation_scaler
 
-    return {'elevation': elevation_scaler}
+    for county in counties:
+        county_values = np.concatenate(
+            [s['values'] for s in county.magnetic.values()]
+            + [county.magnetic.reshape(-1)]
+        )
+        county_values = county_values[~np.isnan(county_values)]
+        n = max(1000, int(len(county_values) * 0.25))
+        n = min(n, len(county_values))
+        sampled_values.append(rng.choice(county_values, size=n, replace=False))
+
+    all_values = np.concatenate(sampled_values).reshape(-1, 1)
+
+    magnetic_scaler = StandardScaler()
+    magnetic_scaler.fit(all_values)
+    scaler_dict['magnetic'] = magnetic_scaler
+
+    for county in counties:
+        county_values = np.concatenate(
+            [s['values'] for s in county.magnetic_fvd.values()]
+            + [county.magnetic_fvd.reshape(-1)]
+        )
+        county_values = county_values[~np.isnan(county_values)]
+        n = max(1000, int(len(county_values) * 0.25))
+        n = min(n, len(county_values))
+        sampled_values.append(rng.choice(county_values, size=n, replace=False))
+
+    all_values = np.concatenate(sampled_values).reshape(-1, 1)
+
+    magnetic_fvd_scaler = StandardScaler()
+    magnetic_fvd_scaler.fit(all_values)
+    scaler_dict['magnetic_fvd'] = magnetic_fvd_scaler
+
+    for county in counties:
+        county_values = np.concatenate(
+            [s['values'] for s in county.magnetic_svd.values()]
+            + [county.magnetic_svd.reshape(-1)]
+        )
+        county_values = county_values[~np.isnan(county_values)]
+        n = max(1000, int(len(county_values) * 0.25))
+        n = min(n, len(county_values))
+        sampled_values.append(rng.choice(county_values, size=n, replace=False))
+
+    all_values = np.concatenate(sampled_values).reshape(-1, 1)
+
+    magnetic_svd_scaler = StandardScaler()
+    magnetic_svd_scaler.fit(all_values)
+    scaler_dict['magnetic_svd'] = magnetic_svd_scaler
+
+    for county in counties:
+        county_values = np.concatenate(
+            [s['values'] for s in county.magnetic_tlt.values()]
+            + [county.magnetic_tlt.reshape(-1)]
+        )
+        county_values = county_values[~np.isnan(county_values)]
+        n = max(1000, int(len(county_values) * 0.25))
+        n = min(n, len(county_values))
+        sampled_values.append(rng.choice(county_values, size=n, replace=False))
+
+    all_values = np.concatenate(sampled_values).reshape(-1, 1)
+
+    magnetic_tlt_scaler = StandardScaler()
+    magnetic_tlt_scaler.fit(all_values)
+    scaler_dict['magnetic_tlt'] = magnetic_tlt_scaler
+
+    for county in counties:
+        county_values = np.concatenate(
+            [s['values'] for s in county.magnetic_ana.values()]
+            + [county.magnetic_ana.reshape(-1)]
+        )
+        county_values = county_values[~np.isnan(county_values)]
+        n = max(1000, int(len(county_values) * 0.25))
+        n = min(n, len(county_values))
+        sampled_values.append(rng.choice(county_values, size=n, replace=False))
+
+    all_values = np.concatenate(sampled_values).reshape(-1, 1)
+
+    magnetic_ana_scaler = StandardScaler()
+    magnetic_ana_scaler.fit(all_values)
+    scaler_dict['magnetic_ana'] = magnetic_ana_scaler
+
+    return scaler_dict
