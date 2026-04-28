@@ -226,12 +226,9 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
                 elevation, top_rasters, base_rasters, alphaearth, magnetic, formation_info, train_dataset, count, device)
 
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                predicted_elevation, predicted_existence = model(elevation, boreholes, alphaearth, magnetic, formation_info)
+                predicted_elevation = model(elevation, boreholes, alphaearth)
 
-                elevation_loss = F.mse_loss(predicted_elevation, top_rasters)
-                existence_loss = F.binary_cross_entropy_with_logits(predicted_existence, existence)
-
-                loss = elevation_loss + 0.25*existence_loss
+                loss = F.mse_loss(predicted_elevation, top_rasters)
 
             optimizer.zero_grad()
             loss.backward()
@@ -259,12 +256,9 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
                     device)
 
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                    predicted_elevation, predicted_existence = model(elevation, boreholes, alphaearth, magnetic, formation_info)
+                    predicted_elevation = model(elevation, boreholes, alphaearth)
 
-                    elevation_loss = F.mse_loss(predicted_elevation, top_rasters)
-                    existence_loss = F.binary_cross_entropy_with_logits(predicted_existence, existence)
-
-                    loss = elevation_loss + 0.25 * existence_loss
+                    loss = F.mse_loss(predicted_elevation, top_rasters)
 
                 test_loss += loss.item()
 

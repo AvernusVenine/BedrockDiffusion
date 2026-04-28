@@ -125,13 +125,6 @@ class BedrockTransformer(nn.Module):
         self.elev_patch_embedding = PatchEmbedding(patch_size, 1, embed_dim)
         self.elev_pos_encoding = PositionalEncoding(embed_dim, raster_size, raster_size, elev_res, bedrock_res)
 
-        ###--- Magnetic Embedding ---###
-        self.mag_patch_embedding = PatchEmbedding(mag_patch_size, 5, embed_dim)
-        self.mag_pos_encoding = PositionalEncoding(embed_dim, int(3*raster_size/10), int(3*raster_size/10), mag_res, bedrock_res)
-
-        ###--- Formation Composition Embedding ---###
-        self.formation_projection = nn.Linear(FormationInfo.FORMATION_INFO_DIM, embed_dim)
-
         ###--- Transformer Architecture ---###
         self.encoder_blocks = nn.ModuleList([
             TransformerBlock(embed_dim, num_heads, mlp_dim) for _ in range(encoder_depth)
@@ -158,30 +151,12 @@ class BedrockTransformer(nn.Module):
             nn.Conv2d(32, 1, kernel_size=3, padding=1)
         )
 
-        ###--- Bedrock Existence Head ---###
-        self.exist_decoder_blocks = nn.ModuleList([
-            TransformerCrossBlock(embed_dim, num_heads, mlp_dim) for _ in range(decoder_depth)
-        ])
-        self.exist_upsample = nn.Sequential(
-            nn.Upsample(scale_factor=patch_size, mode='bilinear', align_corners=False),
-            nn.Conv2d(embed_dim, 1, kernel_size=3, padding=1)
-        )
-        self.exist_refine = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=5, padding=2),
-            nn.GroupNorm(8, 32),
-            nn.SiLU(),
-            nn.Conv2d(32, 32, kernel_size=5, padding=2),
-            nn.GroupNorm(8, 32),
-            nn.SiLU(),
-            nn.Conv2d(32, 1, kernel_size=3, padding=1)
-        )
-
     def apply_mask(self, tokens, B, mask=None):
         if mask is None:
             return tokens
         return tokens[~mask].reshape(B, -1, self.embed_dim)
 
-    def forward(self, elev, bh, ae, mag, fc):
+    def forward(self, elev, bh, ae):
         B, D = elev.shape[0], self.embed_dim
 
         ###--- Embed inputs and apply positional encodings ---###
@@ -194,13 +169,8 @@ class BedrockTransformer(nn.Module):
         ae = self.ae_patch_embedding(ae)
         ae = self.ae_pos_encoding(ae)
 
-        mag = self.mag_patch_embedding(mag)
-        mag = self.mag_pos_encoding(mag)
-
-        fc = self.formation_projection(fc)
-
         ###--- Encoder Blocks ---###
-        encoder_input = torch.concatenate([elev, ae, bh, mag, fc], dim=1)
+        encoder_input = torch.concatenate([elev, ae, bh], dim=1)
 
         for block in self.encoder_blocks:
             encoder_input = block(encoder_input)
@@ -218,13 +188,4 @@ class BedrockTransformer(nn.Module):
         elev_out = self.elev_upsample(elev_queries)
         elev_out = self.elev_refine(elev_out)
 
-        ###--- Existence Head ---###
-        exist_queries = queries
-        for block in self.exist_decoder_blocks:
-            exist_queries = block(exist_queries, encoder_input)
-        exist_queries = exist_queries.permute(0, 2, 1).reshape(B, self.embed_dim, self.H, self.W)
-
-        exist_out = self.exist_upsample(exist_queries)
-        exist_out = self.exist_refine(exist_out)
-
-        return elev_out, exist_out
+        return elev_out
