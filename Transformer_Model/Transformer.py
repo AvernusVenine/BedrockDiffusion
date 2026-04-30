@@ -1,7 +1,6 @@
 import math
 import torch
 import torch.nn as nn
-from Transformer_Model import FormationInfo
 
 class PatchEmbedding(nn.Module):
     def __init__(self, patch_size, in_channels, embed_dim):
@@ -104,6 +103,7 @@ class BedrockTransformer(nn.Module):
 
         self.embed_dim = embed_dim
         self.raster_size = raster_size
+        self.patch_size = patch_size
 
         ###--- Bedrock Queries ---###
         self.bedrock_query_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
@@ -175,14 +175,15 @@ class BedrockTransformer(nn.Module):
             encoder_input = block(encoder_input)
 
         ###--- Bedrock Elevation Query Tokens ---###
-        queries = self.bedrock_query_token.expand(B, self.raster_size**2, self.embed_dim)
+        patch_grid = (self.raster_size // self.patch_size) ** 2
+        queries = self.bedrock_query_token.expand(B, patch_grid, self.embed_dim)
         queries = self.query_pos_encoding(queries)
 
         ###--- Bedrock Surface Elevation Head ---###
         elev_queries = queries
         for block in self.elev_decoder_blocks:
             elev_queries = block(elev_queries, encoder_input)
-        elev_queries = elev_queries.permute(0, 2, 1).reshape(B, self.embed_dim, self.raster_size, self.raster_size)
+        elev_queries = elev_queries.permute(0, 2, 1).reshape(B, self.embed_dim, self.raster_size // self.patch_size, self.raster_size // self.patch_size)
 
         elev_out = self.elev_upsample(elev_queries)
         elev_out = self.elev_refine(elev_out)

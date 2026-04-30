@@ -1,7 +1,6 @@
 import numpy as np
 import Data
 from Transformer_Model.Transformer import BedrockTransformer
-from Transformer_Model import FormationInfo
 import torch
 import torch.nn.functional as F
 from torch.utils.data import random_split, DataLoader
@@ -51,78 +50,127 @@ def prepare_batch(elevation, top_rasters, base_rasters, alphaearth, dataset, bh_
 
     return elevation, top_rasters, existence, alphaearth, boreholes
 
-def test(data_path, model_path, save_path):
-    raster_size = 64
-    patch_size = 16
-    embed_dim = 768
-    mlp_dim = 1024
-    depth = 6
+def test(data_path, model_path, save_path, count=20):
+    model_dict = torch.load(f'{model_path}.mdl')
 
-    rasters, context = Data.load_rasters(data_path)
+    raster_size = model_dict['raster_size']
+    patch_size = model_dict['patch_size']
+    embed_dim = model_dict['embed_dim']
+    encoder_depth = model_dict['encoder_depth']
+    decoder_depth = model_dict['decoder_depth']
+    mlp_dim = model_dict['mlp_dim']
 
-    scaler = joblib.load(f'{model_path}_elevation.scl')
-    scaler_dict = {'elevation': scaler}
+    print('Model loaded')
 
-    valid_mask = np.zeros(context['elevation'].shape, dtype=bool)
-    for sparse in rasters.values():
-        valid_mask[sparse['rows'], sparse['cols']] = True
+    formations = [
+        'kwnd', 'dlp', 'dspl', 'omaq', 'odub', 'ogsv', 'ogpr', 'ogcm', 'odcr', 'opgw', 'ostp', 'opsh', 'opod',
+        'cp', 'cjdn', 'cstl', 'ctcg', 'cwoc', 'cecr', 'cmts'
+    ]
 
-    patches = Data.find_valid_patches(valid_mask, raster_size, raster_size)
+    counties = [Data.CountySource(p, formations) for p in data_path]
 
-    dataset = Data.TransformerDataset(rasters, context, scaler_dict, patches, 1, 256)
+    scaler_dict = {'elevation': joblib.load(f'{model_path}_elevation.scl')}
+
+    dataset = Data.MultiCountyDataset(counties, scaler_dict, 5, raster_size, 1.0)
     dataset.generate_indices()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    model_dict = torch.load(f'{model_path}.mdl')
+    state = {k: v for k, v in model_dict['model'].items() if not k.endswith('pe')}
 
     model = BedrockTransformer(
         raster_size,
         patch_size,
         embed_dim,
         num_heads=8,
-        depth=depth,
-        mlp_dim=mlp_dim,
+        encoder_depth=encoder_depth,
+        decoder_depth=decoder_depth,
+        mlp_dim=mlp_dim
     ).to(device)
-    model.load_state_dict(model_dict['model'])
+    model.load_state_dict(state, strict=False)
 
     model.eval()
 
-    rasters, context, boreholes = dataset[0]
+    elevation, top_rasters, base_rasters, alphaearth, formations = dataset.get_full(0)
+
+    elevation = elevation.unsqueeze(0)
+    top_rasters = top_rasters.unsqueeze(0)
+    base_rasters = base_rasters.unsqueeze(0)
+    alphaearth = alphaearth.unsqueeze(0)
+
+    elevation, top_rasters, base_rasters, alphaearth, boreholes = prepare_batch(
+        elevation, top_rasters, base_rasters, alphaearth, dataset, count, device
+    )
+
+    print('Evaluating...')
 
     with torch.no_grad():
-        context = context.to(device, dtype=torch.float32)
+        elevation = elevation.to(device, dtype=torch.float32)
+        alphaearth = alphaearth.to(device, dtype=torch.float32)
         boreholes = boreholes.to(device, dtype=torch.float32)
 
-        predicted = model(context, boreholes)
+        predicted = model(elevation, boreholes, alphaearth)
 
-    context = context.squeeze(1).cpu().float().numpy()
+    print(' Done')
+
+    elevation = elevation.squeeze(1).cpu().float().numpy()
     predicted = predicted.squeeze(1).cpu().float().numpy()
-    rasters = rasters.squeeze(1).numpy()
-    boreholes = boreholes[:, 2].cpu().float().numpy()
+    top_rasters = top_rasters.squeeze(1).cpu().float().numpy()
 
-    predicted[np.isnan(rasters)] = np.nan
+    c_elev = counties[0].elevation
+    c_elev = scaler_dict['elevation'].transform(c_elev.reshape(-1, 1)).reshape(c_elev.shape)
+    elev_vmin, elev_vmax = np.nanmin(c_elev), np.nanmax(c_elev)
 
-    all_values = np.concatenate([context.ravel(), predicted.ravel(), boreholes.ravel()])
-    vmin, vmax = np.nanmin(all_values), np.nanmax(all_values)
+    all_elevs = np.concatenate([predicted.ravel(), top_rasters.ravel()])
+    vmin, vmax = np.nanmin(all_elevs), np.nanmax(all_elevs)
 
-    fig, axes = plt.subplots(len(rasters), 4, figsize=(20, 5*len(rasters)))
+    print('Creating figures...')
 
-    for row in range(len(predicted)):
-        axes[row, 0].imshow(context[row], cmap='terrain', vmin=vmin, vmax=vmax)
-        axes[row, 0].set_title('Elevation')
+    for idx in range(len(predicted)):
+        fig, axes = plt.subplots(ncols=3, figsize=(15, 5))
 
-        axes[row, 1].imshow(predicted[row], cmap='terrain', vmin=vmin, vmax=vmax)
-        axes[row, 1].set_title(f'Predicted')
+        plt.title(f'{formations[idx].capitalize()}')
 
-        axes[row, 2].imshow(rasters[row], cmap='terrain', vmin=vmin, vmax=vmax)
-        axes[row, 2].set_title(f'Actual')
+        axes[0].imshow(elevation[idx], cmap='terrain', vmin=elev_vmin, vmax=elev_vmax)
+        axes[0].set_title('Elevation')
 
-        axes[row, 3].imshow(boreholes[row] > 0, cmap='binary')
-        axes[row, 3].set_title('Boreholes')
+        axes[1].imshow(predicted[idx], cmap='terrain', vmin=vmin, vmax=vmax)
+        axes[1].set_title('Predicted')
 
-    plt.savefig(f'{save_path}.png')
-    plt.close()
+        axes[2].imshow(top_rasters[idx], cmap='terrain', vmin=vmin, vmax=vmax)
+        axes[2].set_title('Ground Truth')
+
+        plt.savefig(f'{save_path}_{formations[idx]}.png')
+        plt.close()
+
+        print(f' {formations[idx]}')
+
+    #- Use next raster to remove places where the thickness is near 0, signifying the formation does not exist -#
+    for idx in range(len(predicted) - 1):
+        pred_mask = (predicted[idx] - predicted[idx+1]) > .01
+        true_mask = (top_rasters[idx] - top_rasters[idx+1]) > 0
+
+        predicted[idx] = np.where(pred_mask, predicted[idx], np.nan)
+        top_rasters[idx] = np.where(true_mask, top_rasters[idx], np.nan)
+
+    for idx in range(len(predicted)):
+        fig, axes = plt.subplots(ncols=3, figsize=(15, 5))
+
+        plt.title(f'{formations[idx].capitalize()}')
+
+        axes[0].imshow(elevation[idx], cmap='terrain', vmin=elev_vmin, vmax=elev_vmax)
+        axes[0].set_title('Elevation')
+
+        axes[1].imshow(predicted[idx], cmap='terrain', vmin=vmin, vmax=vmax)
+        axes[1].set_title('Predicted')
+
+        axes[2].imshow(top_rasters[idx], cmap='terrain', vmin=vmin, vmax=vmax)
+        axes[2].set_title('Ground Truth')
+
+        plt.savefig(f'{save_path}_{formations[idx]}_masked.png')
+        plt.close()
+
+        print(f' {formations[idx]}')
 
 def train(data_path, save_path, lr=1e-4, max_epochs=100):
     raster_size = 64
@@ -137,7 +185,7 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
     # DATA PREPROCESSING
     # =============================
 
-    print('Loading Rasters')
+    print('Loading rasters')
 
     formations = [
         'kwnd', 'dlp', 'dspl', 'omaq', 'odub', 'ogsv', 'ogpr', 'ogcm', 'odcr', 'opgw', 'ostp', 'opsh', 'opod',
@@ -148,7 +196,7 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
 
     scaler_dict = Data.create_global_scaler_dict(counties)
 
-    print('Generating Scalers')
+    print('Generating scalers')
 
     for k, v in scaler_dict.items():
         joblib.dump(v, f'{save_path}_{k}.scl')
@@ -157,7 +205,7 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
     # DATASET CONSTRUCTION
     # =============================
 
-    dataset = Data.MultiCountyDataset(counties, scaler_dict, data_count, raster_size, 2.0)
+    dataset = Data.MultiCountyDataset(counties, scaler_dict, data_count, raster_size)
 
     test_dataset = dataset.split_test(int(data_count * 0.1))
     train_dataset = dataset
@@ -187,10 +235,6 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
         mlp_dim=mlp_dim,
     ).to(device)
     print(' constructed TERRA')
-    
-    model = torch.compile(model)
-    
-    print(' compiled TERRA')
 
     optimizer = torch.optim.AdamW(
         list(model.parameters()),
@@ -198,6 +242,7 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
         weight_decay=1e-4,
     )
 
+    patience = 0
     best_loss = np.inf
     loss_dict = {'train': [], 'test': []}
 
@@ -257,30 +302,12 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
 
         print(f'Test Loss: {test_loss / len(test_loader)}')
         loss_dict['test'].append(test_loss / len(test_loader))
-        
 
         pd.DataFrame(loss_dict).to_csv(f'{save_path}_loss.csv')
 
-        if epoch == 49:
-            print('Pretraining completed')
-            torch.save(
-                {
-                    'epoch': epoch + 1,
-                    'model': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'loss': test_loss,
-                    'raster_size': raster_size,
-                    'patch_size': patch_size,
-                    'embed_dim': embed_dim,
-                    'encoder_depth': encoder_depth,
-                    'decoder_depth': decoder_depth,
-                    'mlp_dim': mlp_dim,
-                },
-                f'{save_path}_pretrain.mdl'
-            )
-
         if test_loss < best_loss:
             best_loss = test_loss
+            patience = 0
 
             torch.save(
                 {
@@ -297,3 +324,8 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
                 },
                 f'{save_path}.mdl'
             )
+        else:
+            if patience > 15:
+                return
+
+            patience += 1

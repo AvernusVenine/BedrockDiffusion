@@ -4,7 +4,6 @@ from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from torch.utils.data import Dataset, Sampler
 import os
 import warnings
-from Transformer_Model import FormationInfo
 
 warnings.simplefilter("error", RuntimeWarning)
 
@@ -110,13 +109,12 @@ class PatchSampler(Sampler):
 
 
 class MultiCountyDataset(Dataset):
-    def __init__(self, counties, scaler_dict, count, raster_size, btype='paleozoic', temperature=2.0):
+    def __init__(self, counties, scaler_dict, count, raster_size, temperature=2.0):
         self.counties = counties
         self.scaler_dict = scaler_dict
         self.count = count
         self.size = raster_size
         self.temperature = temperature
-        self.btype = btype
 
         self._county_patches = None
         self._county_weights = None
@@ -136,7 +134,6 @@ class MultiCountyDataset(Dataset):
         x, y = patches[patch_idx]
 
         rasters = county.rasters
-        scaler = self.scaler_dict['elevation']
 
         top_rasters = np.array([
             patch_from_sparse(s, x, y, self.size)
@@ -149,32 +146,37 @@ class MultiCountyDataset(Dataset):
 
         ###--- Drop all formations absent from patch ---###
         present = ~np.array([np.isnan(r).all() for r in top_rasters])
+
         top_rasters = top_rasters[present]
         base_rasters = base_rasters[present]
 
+        formations = np.array([k.split('_')[0] for k in rasters.keys() if k.endswith('top')])
+        formations = formations[present]
+
+        top_mean = np.nanmean(top_rasters[-1])
+        base_mean = np.nanmean(base_rasters[-1])
+
+        top_rasters[-1] = np.where(np.isnan(top_rasters[-1]), top_mean, top_rasters[-1])
+        base_rasters[-1] = np.where(np.isnan(base_rasters[-1]), base_mean, base_rasters[-1])
+
         ###--- Fill NaNs using next valid (deeper) formation ---###
         for i in range(len(top_rasters) - 1):
-            nan_mask = np.isnan(top_rasters[i])
-            if not nan_mask.any():
-                continue
             for j in range(i + 1, len(top_rasters)):
-                still_nan = nan_mask & np.isnan(top_rasters[i])
+                still_nan = np.isnan(top_rasters[i])
                 if not still_nan.any():
                     break
                 top_rasters[i] = np.where(still_nan, top_rasters[j], top_rasters[i])
                 base_rasters[i] = np.where(still_nan, top_rasters[j], base_rasters[i])
 
-        top_rasters[-1] = np.nan_to_num(np.nanmean(top_rasters[-1]))
-        base_rasters[-1] = np.nan_to_num(np.nanmean(base_rasters[-1]))
-
-        top_rasters = scaler.transform(top_rasters.reshape(-1, 1)).reshape(top_rasters.shape)
-        base_rasters = scaler.transform(base_rasters.reshape(-1, 1)).reshape(base_rasters.shape)
+        top_rasters = self.scaler_dict['elevation'].transform(top_rasters.reshape(-1, 1)).reshape(top_rasters.shape)
+        base_rasters = self.scaler_dict['elevation'].transform(base_rasters.reshape(-1, 1)).reshape(base_rasters.shape)
 
         top_rasters = torch.from_numpy(top_rasters).unsqueeze(1)
         base_rasters = torch.from_numpy(base_rasters).unsqueeze(1)
 
-        elevation = county.elevation[x:x + self.size, y:y + self.size]
-        elevation = scaler.transform(elevation.reshape(-1, 1)).reshape(elevation.shape)
+        elevation = county.elevation[x:x + self.size, y:y + self.size].astype(np.float32)
+        elevation = np.where(np.isnan(elevation), np.nanmean(elevation), elevation)
+        elevation = self.scaler_dict['elevation'].transform(elevation.reshape(-1, 1)).reshape(elevation.shape)
         elevation = (
             torch.from_numpy(elevation)
             .unsqueeze(0)
@@ -189,27 +191,7 @@ class MultiCountyDataset(Dataset):
             .repeat(top_rasters.shape[0], 1, 1, 1)
         )
 
-        if self.btype == 'paleozoic':
-            return elevation, top_rasters, base_rasters, alphaearth
-        elif self.btype == 'precambrian':
-            magnetic = county.magnetic[x:x + self.size, y:y + self.size]
-            magnetic = (
-                torch.from_numpy(magnetic)
-                .unsqueeze(0)
-                .repeat(top_rasters.shape[0], 1, 1)
-                .unsqueeze(1)
-            )
-            gravity = county.gravity[x:x + self.size, y:y + self.size]
-            gravity = (
-                torch.from_numpy(gravity)
-                .unsqueeze(0)
-                .repeat(top_rasters.shape[0], 1, 1)
-                .unsqueeze(1)
-            )
-
-            return elevation, top_rasters, alphaearth, magnetic, gravity
-
-        return None
+        return elevation, top_rasters, base_rasters, alphaearth, formations
 
     def __getitem__(self, idx):
         if isinstance(idx, tuple):
@@ -379,7 +361,7 @@ class MultiCountyDataset(Dataset):
     def select_boreholes(self, top_rasters, base_rasters, count, seed=None):
         rng = np.random.default_rng(seed)
 
-        out = torch.zeros(4, count, 5, dtype=torch.float32)
+        out = torch.zeros(len(top_rasters), count, 5, dtype=torch.float32)
 
         seen = set()
         sampled = 0
@@ -393,7 +375,7 @@ class MultiCountyDataset(Dataset):
 
             seen.add((x, y))
 
-            for f in range(4):
+            for f in range(len(top_rasters)):
                 top = float(top_rasters[f, 0, x, y])
                 base = float(base_rasters[f, 0, x, y])
 
