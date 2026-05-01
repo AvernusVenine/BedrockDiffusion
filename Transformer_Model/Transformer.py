@@ -1,4 +1,3 @@
-import math
 import torch
 import torch.nn as nn
 
@@ -16,23 +15,12 @@ class PositionalEncoding(nn.Module):
     def __init__(self, embed_dim, H, W, mod_res, base_res):
         super().__init__()
     
-        G = (mod_res / base_res)
+        self.G = (mod_res / base_res)
+        self.embed_dim = embed_dim
+        
         div_term = 1.0 / (10000.0 ** (torch.arange(0, embed_dim // 2).float() / embed_dim))
     
-        row_pos = torch.arange(H).float()
-        col_pos = torch.arange(W).float()
-    
-        row_enc = torch.sin(G * row_pos.unsqueeze(1) * div_term.unsqueeze(0))  # [H, embed_dim//2]
-        col_enc = torch.cos(G * col_pos.unsqueeze(1) * div_term.unsqueeze(0))  # [W, embed_dim//2]
-    
-        row_enc = row_enc.unsqueeze(1).expand(H, W, -1)  # [H, W, embed_dim//2]
-        col_enc = col_enc.unsqueeze(0).expand(H, W, -1)  # [H, W, embed_dim//2]
-    
-        pe = torch.cat([row_enc, col_enc], dim=-1)        # [H, W, embed_dim]
-        self.register_buffer('pe', pe.reshape(1, H*W, embed_dim))
         self.register_buffer('div_term', div_term)
-        self.G = G
-        self.embed_dim = embed_dim
 
     def encode_coords(self, coords):
         B, K, _ = coords.shape
@@ -50,9 +38,22 @@ class PositionalEncoding(nn.Module):
 
         return out
 
-    def forward(self, X):
-        X = X + self.pe[:, :X.size(1)]
-        return X
+    def forward(self, X, H, W):
+        
+        row_pos = torch.arange(H, device=X.device, dtype=X.dtype)
+        col_pos = torch.arange(W, device=X.device, dtype=X.dtype)
+        dt = self.div_term.to(device=X.device, dtype=X.dtype)
+        
+        row_enc = torch.sin(self.G * row_pos.unsqueeze(1) * dt.unsqueeze(0))
+        col_enc = torch.cos(self.G * col_pos.unsqueeze(1) * dt.unsqueeze(0))
+        
+        row_enc = row_enc.unsqueeze(1).expand(H, W, -1)
+        col_enc = col_enc.unsqueeze(0).expand(H, W, -1)
+        
+        pe = torch.cat([row_enc, col_enc], dim=-1)
+        pe = pe.reshape(1, H*W, self.embed_dim)
+        
+        return X + pe
 
 class TransformerCrossBlock(nn.Module):
     def __init__(self, embed_dim, num_heads, mlp_dim):
@@ -138,16 +139,20 @@ class BedrockTransformer(nn.Module):
         ])
         self.elev_upsample = nn.Sequential(
             nn.Upsample(scale_factor=patch_size, mode='bilinear', align_corners=False),
-            nn.Conv2d(embed_dim, 1, kernel_size=3, padding=1)
+            nn.ReplicationPad2d(1),
+            nn.Conv2d(embed_dim, 1, kernel_size=3, padding=0)
         )
         self.elev_refine = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=5, padding=2),
+            nn.ReplicationPad2d(2),
+            nn.Conv2d(1, 32, kernel_size=5, padding=0),
             nn.GroupNorm(8, 32),
             nn.SiLU(),
-            nn.Conv2d(32, 32, kernel_size=5, padding=2),
+            nn.ReplicationPad2d(2),
+            nn.Conv2d(32, 32, kernel_size=5, padding=0),
             nn.GroupNorm(8, 32),
             nn.SiLU(),
-            nn.Conv2d(32, 1, kernel_size=3, padding=1)
+            nn.ReplicationPad2d(1),
+            nn.Conv2d(32, 1, kernel_size=3, padding=0)
         )
 
     def apply_mask(self, tokens, B, mask=None):
@@ -157,16 +162,19 @@ class BedrockTransformer(nn.Module):
 
     def forward(self, elev, bh, ae):
         B, D = elev.shape[0], self.embed_dim
+        
+        H = elev.shape[2] // self.patch_size
+        W = elev.shape[3] // self.patch_size
 
         ###--- Embed inputs and apply positional encodings ---###
         elev = self.elev_patch_embedding(elev)
-        elev = self.elev_pos_encoding(elev)
+        elev = self.elev_pos_encoding(elev, H, W)
 
         bh_tokens = self.borehole_projection(bh[:, :, :3])
         bh = bh_tokens + self.borehole_pos_encoding.encode_coords(bh[:, :, 3:])
 
         ae = self.ae_patch_embedding(ae)
-        ae = self.ae_pos_encoding(ae)
+        ae = self.ae_pos_encoding(ae, H, W)
 
         ###--- Encoder Blocks ---###
         encoder_input = torch.concatenate([elev, ae, bh], dim=1)
@@ -177,7 +185,7 @@ class BedrockTransformer(nn.Module):
         ###--- Bedrock Elevation Query Tokens ---###
         patch_grid = (self.raster_size // self.patch_size) ** 2
         queries = self.bedrock_query_token.expand(B, patch_grid, self.embed_dim)
-        queries = self.query_pos_encoding(queries)
+        queries = self.query_pos_encoding(queries, H, W)
 
         ###--- Bedrock Surface Elevation Head ---###
         elev_queries = queries

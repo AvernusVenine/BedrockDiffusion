@@ -26,7 +26,7 @@ def prepare_batch(elevation, top_rasters, base_rasters, alphaearth, device):
     return elevation, top_rasters, alphaearth
 
 def train(data_path, save_path, lr=1e-4, max_epochs=100):
-    data_count = 3000
+    data_count = 500
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # =============================
@@ -108,6 +108,10 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
         weight_decay=1e-4,
     )
 
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.2, patience=10
+    )
+
     patience = 0
 
     best_loss = np.inf
@@ -127,7 +131,7 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
 
         for elevation, top_rasters, base_rasters, alphaearth in train_loader:
 
-            elevation, top_rasters, alphaearth= prepare_batch(elevation, top_rasters, base_rasters, alphaearth, device)
+            elevation, top_rasters, alphaearth = prepare_batch(elevation, top_rasters, base_rasters, alphaearth, device)
 
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
 
@@ -150,8 +154,9 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
                             b_tile = base_rasters[:, :, r0:r1, c0:c1]
                             ae_tile = alphaearth[:, :, r0:r1, c0:c1]
 
-                            boreholes = [train_dataset.select_boreholes(top, base, count=count) for top, base in zip(t_tile, b_tile)]
+                            boreholes = [train_dataset.select_boreholes(top, base, count=count, size=raster_size) for top, base in zip(t_tile, b_tile)]
                             boreholes = torch.stack(boreholes).reshape(B, count, 5)
+                            boreholes = boreholes.to(device, dtype=torch.bfloat16)
 
                             tile_pred = terra(elev_tile, boreholes, ae_tile)
                             terra_pred[:, :, r0:r1, c0:c1] = tile_pred
@@ -238,6 +243,8 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
                     loss = F.mse_loss(smoothed, top_rasters)
 
                 test_loss += loss.item()
+
+        scheduler.step(test_loss)
 
         print(f'Test Loss: {test_loss / len(test_loader)}')
         loss_dict['test'].append(test_loss / len(test_loader))

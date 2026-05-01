@@ -7,6 +7,8 @@ from torch.utils.data import random_split, DataLoader
 import pandas as pd
 import joblib
 import matplotlib.pyplot as plt
+import time
+import random
 
 class BoreholeScheduler:
     def __init__(self, max_count_range, min_count_range, warmup_epochs):
@@ -25,7 +27,27 @@ class BoreholeScheduler:
     
         return int(self.rng.integers(current_min, current_max + 1))
 
+def augment_batch(elevation, top_rasters, base_rasters, alphaearth):
+
+    k = random.randint(0, 3)
+    flip = random.random() < 0.5
+
+    elevation = torch.rot90(elevation, k=k, dims=(-2, -1))
+    top_rasters = torch.rot90(top_rasters, k=k, dims=(-2, -1))
+    base_rasters = torch.rot90(base_rasters, k=k, dims=(-2, -1))
+    alphaearth = torch.rot90(alphaearth, k=k, dims=(-2, -1))
+
+    if flip:
+        elevation = torch.flip(elevation, dims=(-1,))
+        top_rasters = torch.flip(top_rasters, dims=(-1,))
+        base_rasters = torch.flip(base_rasters, dims=(-1,))
+        alphaearth = torch.flip(alphaearth, dims=(-1,))
+
+    return elevation, top_rasters, base_rasters, alphaearth
+
 def prepare_batch(elevation, top_rasters, base_rasters, alphaearth, dataset, bh_count, device):
+    elevation, top_rasters, base_rasters, alphaearth = augment_batch(elevation, top_rasters, base_rasters, alphaearth)
+
     B, F, _, H, W = elevation.shape
 
     elevation = elevation[:, 0].unsqueeze(1).expand(B, F, 1, H, W).reshape(B*F, 1, H, W)
@@ -42,15 +64,15 @@ def prepare_batch(elevation, top_rasters, base_rasters, alphaearth, dataset, bh_
     thickness = (top_rasters - base_rasters).nan_to_num(0.0)
     existence = (thickness > 0).float()
 
-    elevation = elevation.to(device, dtype=torch.bfloat16)
-    alphaearth = alphaearth.to(device, dtype=torch.bfloat16)
-    existence = existence.to(device, dtype=torch.bfloat16)
-    top_rasters = top_rasters.to(device, dtype=torch.bfloat16)
-    boreholes = boreholes.to(device, dtype=torch.bfloat16)
+    elevation = elevation.to(device, dtype=torch.float32)
+    alphaearth = alphaearth.to(device, dtype=torch.float32)
+    existence = existence.to(device, dtype=torch.float32)
+    top_rasters = top_rasters.to(device, dtype=torch.float32)
+    boreholes = boreholes.to(device, dtype=torch.float32)
 
     return elevation, top_rasters, existence, alphaearth, boreholes
 
-def test(data_path, model_path, save_path, count=20):
+def test(data_path, model_path, save_path, count=20, total_size=None):
     model_dict = torch.load(f'{model_path}.mdl')
 
     raster_size = model_dict['raster_size']
@@ -71,7 +93,7 @@ def test(data_path, model_path, save_path, count=20):
 
     scaler_dict = {'elevation': joblib.load(f'{model_path}_elevation.scl')}
 
-    dataset = Data.MultiCountyDataset(counties, scaler_dict, 5, raster_size, 1.0)
+    dataset = Data.MultiCountyDataset(counties, scaler_dict, 1, total_size, 1.0)
     dataset.generate_indices()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -102,16 +124,35 @@ def test(data_path, model_path, save_path, count=20):
         elevation, top_rasters, base_rasters, alphaearth, dataset, count, device
     )
 
+    B, C, H, W = top_rasters.shape
+    predicted = torch.zeros(B, C, H, W, device=device)
+
+    n = total_size // raster_size
+
     print('Evaluating...')
+    t = time.time()
 
-    with torch.no_grad():
-        elevation = elevation.to(device, dtype=torch.float32)
-        alphaearth = alphaearth.to(device, dtype=torch.float32)
-        boreholes = boreholes.to(device, dtype=torch.float32)
+    for i in range(n):
+        for j in range(n):
+            r0, r1 = i * raster_size, (i + 1) * raster_size
+            c0, c1 = j * raster_size, (j + 1) * raster_size
 
-        predicted = model(elevation, boreholes, alphaearth)
+            elev_tile = elevation[:, :, r0:r1, c0:c1]
+            t_tile = top_rasters[:, :, r0:r1, c0:c1].unsqueeze(1)
+            b_tile = base_rasters[:, :, r0:r1, c0:c1].unsqueeze(1)
+            ae_tile = alphaearth[:, :, r0:r1, c0:c1]
+
+            boreholes = [dataset.select_boreholes(top, base, count=count, size=raster_size) for top, base in zip(t_tile, b_tile)]
+            boreholes = torch.stack(boreholes).reshape(B, count, 5)
+            boreholes = boreholes.to(device, dtype=torch.float32)
+
+            with torch.no_grad():
+                tile_pred = model(elev_tile, boreholes, ae_tile)
+
+            predicted[:, :, r0:r1, c0:c1] = tile_pred
 
     print(' Done')
+    print(time.time() - t)
 
     elevation = elevation.squeeze(1).cpu().float().numpy()
     predicted = predicted.squeeze(1).cpu().float().numpy()
@@ -145,35 +186,8 @@ def test(data_path, model_path, save_path, count=20):
 
         print(f' {formations[idx]}')
 
-    #- Use next raster to remove places where the thickness is near 0, signifying the formation does not exist -#
-    for idx in range(len(predicted) - 1):
-        pred_mask = (predicted[idx] - predicted[idx+1]) > .01
-        true_mask = (top_rasters[idx] - top_rasters[idx+1]) > 0
-
-        predicted[idx] = np.where(pred_mask, predicted[idx], np.nan)
-        top_rasters[idx] = np.where(true_mask, top_rasters[idx], np.nan)
-
-    for idx in range(len(predicted)):
-        fig, axes = plt.subplots(ncols=3, figsize=(15, 5))
-
-        plt.title(f'{formations[idx].capitalize()}')
-
-        axes[0].imshow(elevation[idx], cmap='terrain', vmin=elev_vmin, vmax=elev_vmax)
-        axes[0].set_title('Elevation')
-
-        axes[1].imshow(predicted[idx], cmap='terrain', vmin=vmin, vmax=vmax)
-        axes[1].set_title('Predicted')
-
-        axes[2].imshow(top_rasters[idx], cmap='terrain', vmin=vmin, vmax=vmax)
-        axes[2].set_title('Ground Truth')
-
-        plt.savefig(f'{save_path}_{formations[idx]}_masked.png')
-        plt.close()
-
-        print(f' {formations[idx]}')
-
 def train(data_path, save_path, lr=1e-4, max_epochs=100):
-    raster_size = 64
+    raster_size = 128
     patch_size = 16
     embed_dim = 512
     mlp_dim = 1024
@@ -210,8 +224,8 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
     test_dataset = dataset.split_test(int(data_count * 0.1))
     train_dataset = dataset
 
-    train_loader = DataLoader(train_dataset, batch_size=6, num_workers=0)
-    test_loader = DataLoader(test_dataset, batch_size=6, num_workers=0)
+    train_loader = DataLoader(train_dataset, batch_size=8, num_workers=0)
+    test_loader = DataLoader(test_dataset, batch_size=8, num_workers=0)
 
     test_dataset.generate_indices()
 
@@ -240,6 +254,10 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
         list(model.parameters()),
         lr=lr,
         weight_decay=1e-4,
+    )
+
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.2, patience=10
     )
 
     patience = 0
@@ -300,6 +318,8 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
 
                 test_loss += loss.item()
 
+        scheduler.step(test_loss)
+
         print(f'Test Loss: {test_loss / len(test_loader)}')
         loss_dict['test'].append(test_loss / len(test_loader))
 
@@ -325,7 +345,7 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
                 f'{save_path}.mdl'
             )
         else:
-            if patience > 15:
+            if patience > 20:
                 return
 
             patience += 1

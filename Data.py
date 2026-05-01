@@ -358,7 +358,10 @@ class MultiCountyDataset(Dataset):
 
         return test_dataset
 
-    def select_boreholes(self, top_rasters, base_rasters, count, seed=None):
+    def select_boreholes(self, top_rasters, base_rasters, count, seed=None, size=None):
+        if size is None:
+            size = self.size
+
         rng = np.random.default_rng(seed)
 
         out = torch.zeros(len(top_rasters), count, 5, dtype=torch.float32)
@@ -367,8 +370,8 @@ class MultiCountyDataset(Dataset):
         sampled = 0
 
         while sampled < count:
-            x = rng.integers(0, self.size)
-            y = rng.integers(0, self.size)
+            x = rng.integers(0, size)
+            y = rng.integers(0, size)
 
             if (x, y) in seen:
                 continue
