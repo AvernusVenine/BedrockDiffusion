@@ -7,8 +7,30 @@ import joblib
 import Data
 from Transformer_Model.Transformer import BedrockTransformer
 from Smoothing_Model.Transformer import SmoothingTransformer
+import random
+
+def augment_batch(elevation, top_rasters, base_rasters, alphaearth):
+
+    k = random.randint(0, 3)
+    flip = random.random() < 0.5
+
+    elevation = torch.rot90(elevation, k=k, dims=(-2, -1))
+    top_rasters = torch.rot90(top_rasters, k=k, dims=(-2, -1))
+    base_rasters = torch.rot90(base_rasters, k=k, dims=(-2, -1))
+    alphaearth = torch.rot90(alphaearth, k=k, dims=(-2, -1))
+
+    if flip:
+        elevation = torch.flip(elevation, dims=(-1,))
+        top_rasters = torch.flip(top_rasters, dims=(-1,))
+        base_rasters = torch.flip(base_rasters, dims=(-1,))
+        alphaearth = torch.flip(alphaearth, dims=(-1,))
+
+    return elevation, top_rasters, base_rasters, alphaearth
+
 
 def prepare_batch(elevation, top_rasters, base_rasters, alphaearth, device):
+    elevation, top_rasters, base_rasters, alphaearth = augment_batch(elevation, top_rasters, base_rasters, alphaearth)
+
     B, F, _, H, W = elevation.shape
 
     elevation = elevation[:, 0].unsqueeze(1).expand(B, F, 1, H, W).reshape(B * F, 1, H, W)
