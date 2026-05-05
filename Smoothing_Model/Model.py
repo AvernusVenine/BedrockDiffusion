@@ -47,6 +47,19 @@ def prepare_batch(elevation, top_rasters, base_rasters, alphaearth, device):
 
     return elevation, top_rasters, alphaearth
 
+def terra_mask(N, B, device, alpha):
+    beta = torch.distributions.Beta(torch.tensor(alpha), torch.tensor(alpha))
+    mask_ratio = beta.sample().item()
+
+    mask_ratio = max(0.1, min(mask_ratio, 0.95))
+    num = max(int(N * (1.0 - mask_ratio)), 1)
+
+    noise = torch.rand(B, N, device=device)
+    rank = noise.argsort(dim=1)
+    mask = rank >= num
+
+    return mask
+
 def train(data_path, save_path, lr=1e-4, max_epochs=100):
     data_count = 500
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -60,8 +73,7 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
     raster_size = model_dict['raster_size']
     patch_size = model_dict['patch_size']
     embed_dim = model_dict['embed_dim']
-    encoder_depth = model_dict['encoder_depth']
-    decoder_depth = model_dict['decoder_depth']
+    depth = model_dict['depth']
     mlp_dim = model_dict['mlp_dim']
 
     terra = BedrockTransformer(
@@ -69,8 +81,7 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
         patch_size,
         embed_dim,
         num_heads=8,
-        encoder_depth=encoder_depth,
-        decoder_depth=decoder_depth,
+        depth=depth,
         mlp_dim=mlp_dim
     ).to(device)
     terra.load_state_dict(model_dict['model'])
@@ -90,7 +101,7 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
     patch_size = 16
     embed_dim = 256
     mlp_dim = 512
-    depth = 6
+    depth = 8
 
     print('Loading rasters')
 
@@ -131,7 +142,7 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
     )
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.2, patience=10
+        optimizer, mode='min', factor=0.5, patience=10
     )
 
     patience = 0
@@ -196,8 +207,14 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
 
                 terra_pred = terra_pred[:, :, r0:r0+target_size, c0:c0+target_size]
                 top_rasters = top_rasters[:, :, r0:r0+target_size, c0:c0+target_size]
+                elevation = elevation[:, :, r0:r0+target_size, c0:c0+target_size]
 
-                smoothed = model(terra_pred)
+                N = (target_size // patch_size) ** 2
+                alpha = max(1.0, 5.0 * (1.0 - epoch / 30))
+
+                mask = terra_mask(N, B, device, alpha=alpha)
+
+                smoothed = model(elevation, terra_pred, mask=mask)
 
                 loss = F.mse_loss(smoothed, top_rasters)
 
@@ -259,8 +276,11 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
 
                     terra_pred = terra_pred[:, :, r0:r0 + target_size, c0:c0 + target_size]
                     top_rasters = top_rasters[:, :, r0:r0 + target_size, c0:c0 + target_size]
+                    elevation = elevation[:, :, r0:r0+target_size, c0:c0+target_size]
 
-                    smoothed = model(terra_pred)
+
+
+                    smoothed = model(elevation, terra_pred)
 
                     loss = F.mse_loss(smoothed, top_rasters)
 

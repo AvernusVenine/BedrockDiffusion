@@ -1,6 +1,50 @@
 import torch
 import torch.nn as nn
 
+class CNNPatchEmbedding(nn.Module):
+    def __init__(self, patch_size, embed_dim):
+        super().__init__()
+
+        self.patch_size = patch_size
+        self.embed_dim = embed_dim
+
+        #- Feature Extraction -#
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+        )
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.GELU(),
+        )
+
+        #- Splits into patches and projects -#
+        self.proj = nn.Conv2d(128, embed_dim, kernel_size=patch_size, stride=patch_size, padding=0, bias=False)
+
+        ###--- Residual Skip ---###
+        self.residual = nn.Sequential(
+            nn.Conv2d(1, 128, kernel_size=1, bias=False),
+            nn.BatchNorm2d(128),
+        )
+
+    def forward(self, X):
+        residual = self.residual(X)
+
+        X = self.conv1(X)
+        X = self.conv2(X)
+        X = self.conv3(X)
+
+        X = X + residual
+
+        X = self.proj(X).flatten(2).transpose(1, 2)
+        return X
 
 class PatchEmbedding(nn.Module):
     def __init__(self, patch_size, in_channels, embed_dim):
@@ -10,7 +54,6 @@ class PatchEmbedding(nn.Module):
     def forward(self, X):
         X = self.proj(X).flatten(2).transpose(1, 2)
         return X
-
 
 class PositionalEncoding(nn.Module):
     def __init__(self, embed_dim, mod_res, base_res):
@@ -39,27 +82,6 @@ class PositionalEncoding(nn.Module):
 
         return X + pe
 
-class TransformerCrossBlock(nn.Module):
-    def __init__(self, embed_dim, num_heads, mlp_dim):
-        super().__init__()
-        self.cross_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
-        self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, mlp_dim),
-            nn.SiLU(),
-            nn.Linear(mlp_dim, embed_dim),
-        )
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.norm2 = nn.LayerNorm(embed_dim)
-        self.norm3 = nn.LayerNorm(embed_dim)
-
-    def forward(self, X, ctx):
-        ctx = self.norm1(ctx).float()
-        X_f = self.norm2(X).float()
-        X = X + self.cross_attn(X_f, ctx, ctx)[0].to(X.dtype)
-        X = X + self.mlp(self.norm3(X))
-        return X
-
-
 class TransformerBlock(nn.Module):
     def __init__(self, embed_dim, num_heads, mlp_dim):
         super().__init__()
@@ -78,31 +100,45 @@ class TransformerBlock(nn.Module):
         X = X + self.mlp(self.norm2(X))
         return X
 
+
 class SmoothingTransformer(nn.Module):
     def __init__(self, patch_size, embed_dim, num_heads, depth, mlp_dim):
         super().__init__()
-
-        bedrock_res = 30
 
         self.embed_dim = embed_dim
         self.patch_size = patch_size
 
         ###--- Bedrock Embedding ---###
-        self.patch_embedding = PatchEmbedding(patch_size, 1, embed_dim)
-        self.pos_encoding = PositionalEncoding(embed_dim, bedrock_res, bedrock_res)
+        self.patch_embedding = CNNPatchEmbedding(patch_size, embed_dim)
+        self.pos_encoding = PositionalEncoding(embed_dim, 1, 1)
+
+        ###--- Elevation Embedding ---###
+        self.elev_patch_embedding = CNNPatchEmbedding(patch_size, embed_dim)
+        self.elev_pos_encoding = PositionalEncoding(embed_dim, 1, 1)
 
         ###--- Transformer Architecture ---###
         self.encoder_blocks = nn.ModuleList([
             TransformerBlock(embed_dim, num_heads, mlp_dim) for _ in range(depth)
         ])
 
+        ###--- Elevation Skip Connection ---###
+        self.elev_skip = nn.Sequential(
+            nn.ReplicationPad2d(1),
+            nn.Conv2d(1, 64, kernel_size=3, padding=0),
+            nn.GroupNorm(8, 64),
+            nn.SiLU(),
+            nn.ReplicationPad2d(1),
+            nn.Conv2d(64, 64, kernel_size=3, padding=0)
+        )
+
+        ###--- Bedrock Refining ---###
         self.upsample = nn.Sequential(
             nn.Upsample(scale_factor=patch_size, mode='bilinear', align_corners=False),
             nn.Conv2d(embed_dim, 1, kernel_size=3, padding=1)
         )
 
         self.refine = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=5, padding=2),
+            nn.Conv2d(65, 32, kernel_size=5, padding=2),
             nn.GroupNorm(8, 32),
             nn.SiLU(),
             nn.Conv2d(32, 32, kernel_size=5, padding=2),
@@ -111,21 +147,37 @@ class SmoothingTransformer(nn.Module):
             nn.Conv2d(32, 1, kernel_size=3, padding=1),
         )
 
-    def forward(self, X):
-        B = X.shape[0]
+    def forward(self, elev, terra, mask=None):
+        B, D = elev.shape[0], self.embed_dim
 
-        H = X.shape[2] // self.patch_size
-        W = X.shape[3] // self.patch_size
+        H = elev.shape[2] // self.patch_size
+        W = elev.shape[3] // self.patch_size
 
-        X = self.patch_embedding(X)
-        X = self.pos_encoding(X, H, W)
+        ###--- Elevation skip connection ---###
+        e_skip = self.elev_skip(elev)
+
+        ###--- Embed inputs and apply positional encodings ---###
+        terra = self.patch_embedding(terra)
+        terra = self.pos_encoding(terra, H, W)
+
+        if mask is not None:
+            terra = terra[~mask].reshape(B, -1, D)
+
+        elev = self.elev_patch_embedding(elev)
+        elev = self.elev_pos_encoding(elev, H, W)
+
+        n_elev = elev.shape[1]
+        encoder_input = torch.concatenate([elev, terra], dim=1)
 
         for block in self.encoder_blocks:
-            X = block(X)
+            encoder_input = block(encoder_input)
 
-        X = X.permute(0, 2, 1).reshape(B, self.embed_dim, H, W)
+        #- Extract encoded elevation and apply skip connection -#
+        elev = encoder_input[:, :n_elev, :]
+        elev = elev.permute(0, 2, 1).reshape(B, self.embed_dim, H, W)
+        elev = self.upsample(elev)
 
-        X = self.upsample(X)
-        X = self.refine(X)
+        elev = torch.concatenate([elev, e_skip], dim=1)
+        elev = self.refine(elev)
 
-        return X
+        return elev

@@ -192,8 +192,7 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
     embed_dim = 512
     mlp_dim = 1024
     data_count = 3000
-    encoder_depth = 6
-    decoder_depth = 4
+    encoder_depth = 10
 
     # =============================
     # DATA PREPROCESSING
@@ -244,8 +243,7 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
         patch_size,
         embed_dim,
         num_heads=8,
-        encoder_depth=encoder_depth,
-        decoder_depth=decoder_depth,
+        depth=encoder_depth,
         mlp_dim=mlp_dim,
     ).to(device)
     print(' constructed TERRA')
@@ -257,7 +255,7 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
     )
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.2, patience=10
+        optimizer, mode='min', factor=0.5, patience=10
     )
 
     patience = 0
@@ -338,8 +336,7 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
                     'raster_size': raster_size,
                     'patch_size': patch_size,
                     'embed_dim': embed_dim,
-                    'encoder_depth': encoder_depth,
-                    'decoder_depth': decoder_depth,
+                    'depth': encoder_depth,
                     'mlp_dim': mlp_dim,
                 },
                 f'{save_path}.mdl'

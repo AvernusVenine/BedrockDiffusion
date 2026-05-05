@@ -341,7 +341,6 @@ class MultiCountyDataset(Dataset):
             train_patch_lists.append([p for i, p in enumerate(patches) if i not in chosen_set])
 
         test_count = sum(len(p) for p in test_patch_lists)
-        print(test_count)
 
         test_dataset = MultiCountyDataset(
             self.counties,

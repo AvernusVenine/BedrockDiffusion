@@ -95,12 +95,8 @@ class TransformerBlock(nn.Module):
 
 
 class BedrockTransformer(nn.Module):
-    def __init__(self, raster_size, patch_size, embed_dim, num_heads, encoder_depth, decoder_depth, mlp_dim):
+    def __init__(self, raster_size, patch_size, embed_dim, num_heads, depth, mlp_dim):
         super().__init__()
-
-        bedrock_res = 30
-        ae_res = 30
-        elev_res = 30
 
         self.embed_dim = embed_dim
         self.raster_size = raster_size
@@ -110,33 +106,39 @@ class BedrockTransformer(nn.Module):
         self.bedrock_query_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         nn.init.trunc_normal_(self.bedrock_query_token, std=0.02)
 
-        self.query_pos_encoding = PositionalEncoding(embed_dim, raster_size, raster_size, bedrock_res, bedrock_res)
+        self.query_pos_encoding = PositionalEncoding(embed_dim, raster_size, raster_size, 1, 1)
 
         ###--- Borehole Embedding ---###
         #- (Existence, Elevation Top, Elevation Bot) -#
         self.borehole_projection = nn.Linear(3, embed_dim)
-        self.borehole_pos_encoding = PositionalEncoding(embed_dim, raster_size, raster_size, bedrock_res, bedrock_res)
+        self.borehole_pos_encoding = PositionalEncoding(embed_dim, raster_size, raster_size, 1, 16)
 
         ###--- AlphaEarth Embedding ---###
         self.ae_patch_embedding = PatchEmbedding(patch_size, 64, embed_dim)
-        self.ae_pos_encoding = PositionalEncoding(embed_dim, raster_size, raster_size, ae_res, bedrock_res)
+        self.ae_pos_encoding = PositionalEncoding(embed_dim, raster_size, raster_size, 1, 1)
 
         ###--- Elevation Embedding ---###
         self.elev_patch_embedding = PatchEmbedding(patch_size, 1, embed_dim)
-        self.elev_pos_encoding = PositionalEncoding(embed_dim, raster_size, raster_size, elev_res, bedrock_res)
+        self.elev_pos_encoding = PositionalEncoding(embed_dim, raster_size, raster_size, 1, 1)
 
         ###--- Transformer Architecture ---###
         self.encoder_blocks = nn.ModuleList([
-            TransformerBlock(embed_dim, num_heads, mlp_dim) for _ in range(encoder_depth)
-        ])
-        self.decoder_blocks = nn.ModuleList([
-            TransformerCrossBlock(embed_dim, num_heads, mlp_dim) for _ in range(decoder_depth)
+            TransformerBlock(embed_dim, num_heads, mlp_dim) for _ in range(depth)
         ])
 
+        ###--- Elevation Skip Connection ---###
+        self.elev_skip = nn.Sequential(
+            nn.ReplicationPad2d(1),
+            nn.Conv2d(1, 64, kernel_size=3, padding=0),
+            nn.GroupNorm(8, 64),
+            nn.SiLU(),
+            nn.ReplicationPad2d(1),
+            nn.Conv2d(64, 64, kernel_size=3, padding=0),
+            nn.GroupNorm(8, 64),
+            nn.SiLU(),
+        )
+
         ###--- Bedrock Surface Elevation Head ---###
-        self.elev_decoder_blocks = nn.ModuleList([
-            TransformerCrossBlock(embed_dim, num_heads, mlp_dim) for _ in range(decoder_depth)
-        ])
         self.elev_upsample = nn.Sequential(
             nn.Upsample(scale_factor=patch_size, mode='bilinear', align_corners=False),
             nn.ReplicationPad2d(1),
@@ -144,7 +146,7 @@ class BedrockTransformer(nn.Module):
         )
         self.elev_refine = nn.Sequential(
             nn.ReplicationPad2d(2),
-            nn.Conv2d(1, 32, kernel_size=5, padding=0),
+            nn.Conv2d(65, 32, kernel_size=5, padding=0),
             nn.GroupNorm(8, 32),
             nn.SiLU(),
             nn.ReplicationPad2d(2),
@@ -154,6 +156,7 @@ class BedrockTransformer(nn.Module):
             nn.ReplicationPad2d(1),
             nn.Conv2d(32, 1, kernel_size=3, padding=0)
         )
+
 
     def apply_mask(self, tokens, B, mask=None):
         if mask is None:
@@ -166,6 +169,9 @@ class BedrockTransformer(nn.Module):
         H = elev.shape[2] // self.patch_size
         W = elev.shape[3] // self.patch_size
 
+        ###--- Elevation Skip Connection ---###
+        e_skip = self.elev_skip(elev)
+
         ###--- Embed inputs and apply positional encodings ---###
         elev = self.elev_patch_embedding(elev)
         elev = self.elev_pos_encoding(elev, H, W)
@@ -177,23 +183,18 @@ class BedrockTransformer(nn.Module):
         ae = self.ae_pos_encoding(ae, H, W)
 
         ###--- Encoder Blocks ---###
+        n_elev = elev.shape[1]
         encoder_input = torch.concatenate([elev, ae, bh], dim=1)
 
         for block in self.encoder_blocks:
             encoder_input = block(encoder_input)
 
-        ###--- Bedrock Elevation Query Tokens ---###
-        patch_grid = (self.raster_size // self.patch_size) ** 2
-        queries = self.bedrock_query_token.expand(B, patch_grid, self.embed_dim)
-        queries = self.query_pos_encoding(queries, H, W)
+        #- Extract encoded elevation and apply skip connection -#
+        elev = encoder_input[:, :n_elev, :]
+        elev = elev.permute(0, 2, 1).reshape(B, self.embed_dim, self.raster_size // self.patch_size, self.raster_size // self.patch_size)
+        elev = self.elev_upsample(elev)
 
-        ###--- Bedrock Surface Elevation Head ---###
-        elev_queries = queries
-        for block in self.elev_decoder_blocks:
-            elev_queries = block(elev_queries, encoder_input)
-        elev_queries = elev_queries.permute(0, 2, 1).reshape(B, self.embed_dim, self.raster_size // self.patch_size, self.raster_size // self.patch_size)
+        elev = torch.concatenate([elev, e_skip], dim=1)
+        elev = self.elev_refine(elev)
 
-        elev_out = self.elev_upsample(elev_queries)
-        elev_out = self.elev_refine(elev_out)
-
-        return elev_out
+        return elev
