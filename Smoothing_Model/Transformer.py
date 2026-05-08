@@ -10,27 +10,30 @@ class CNNPatchEmbedding(nn.Module):
 
         #- Feature Extraction -#
         self.conv1 = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.ReplicationPad2d(1),
+            nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=0),
             nn.BatchNorm2d(32),
-            nn.GELU(),
+            nn.SiLU(),
         )
         self.conv2 = nn.Sequential(
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.ReplicationPad2d(1),
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=0),
             nn.BatchNorm2d(64),
-            nn.GELU(),
+            nn.SiLU(),
         )
         self.conv3 = nn.Sequential(
-            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.ReplicationPad2d(1),
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=0),
             nn.BatchNorm2d(128),
-            nn.GELU(),
+            nn.SiLU(),
         )
 
         #- Splits into patches and projects -#
-        self.proj = nn.Conv2d(128, embed_dim, kernel_size=patch_size, stride=patch_size, padding=0, bias=False)
+        self.proj = nn.Conv2d(128, embed_dim, kernel_size=patch_size, stride=patch_size, padding=0)
 
         ###--- Residual Skip ---###
         self.residual = nn.Sequential(
-            nn.Conv2d(1, 128, kernel_size=1, bias=False),
+            nn.Conv2d(1, 128, kernel_size=1),
             nn.BatchNorm2d(128),
         )
 
@@ -124,28 +127,51 @@ class SmoothingTransformer(nn.Module):
         ###--- Elevation Skip Connection ---###
         self.elev_skip = nn.Sequential(
             nn.ReplicationPad2d(1),
-            nn.Conv2d(1, 64, kernel_size=3, padding=0),
+            nn.Conv2d(1, 32, kernel_size=3, padding=0),
+            nn.GroupNorm(8, 32),
+            nn.SiLU(),
+            nn.ReplicationPad2d(1),
+            nn.Conv2d(32, 64, kernel_size=3, padding=0)
+        )
+
+        ###--- Bedrock Upsampling Head ---###
+        self.upsample = nn.Sequential(
+            nn.ReplicationPad2d(1),
+            nn.Conv2d(embed_dim, 128 * 16, kernel_size=3, padding=0),
+            nn.PixelShuffle(4),
+            nn.GroupNorm(8, 128),
+            nn.SiLU(),
+            nn.ReplicationPad2d(1),
+            nn.Conv2d(128, 64 * 16, kernel_size=3, padding=0),
+            nn.PixelShuffle(4),
             nn.GroupNorm(8, 64),
             nn.SiLU(),
             nn.ReplicationPad2d(1),
-            nn.Conv2d(64, 64, kernel_size=3, padding=0)
-        )
-
-        ###--- Bedrock Refining ---###
-        self.upsample = nn.Sequential(
-            nn.Upsample(scale_factor=patch_size, mode='bilinear', align_corners=False),
-            nn.Conv2d(embed_dim, 1, kernel_size=3, padding=1)
+            nn.Conv2d(64, 32 * 16, kernel_size=3, padding=0),
+            nn.PixelShuffle(4),
+            nn.GroupNorm(8, 32),
+            nn.SiLU()
         )
 
         self.refine = nn.Sequential(
-            nn.Conv2d(65, 32, kernel_size=5, padding=2),
-            nn.GroupNorm(8, 32),
+            nn.Conv2d(96, 64, kernel_size=5, padding=2),
+            nn.GroupNorm(8, 64),
             nn.SiLU(),
-            nn.Conv2d(32, 32, kernel_size=5, padding=2),
+            nn.Conv2d(64, 32, kernel_size=5, padding=2),
             nn.GroupNorm(8, 32),
             nn.SiLU(),
             nn.Conv2d(32, 1, kernel_size=3, padding=1),
         )
+
+        #- Initialize upscale weights to avoid checkerboard patterns -#
+        for layer in self.upsample:
+            if isinstance(layer, nn.Conv2d):
+                weight = layer.weight.data
+                out_channels, in_channels, H, W = weight.shape
+                sub = torch.zeros(out_channels // 16, in_channels, H, W)
+                nn.init.kaiming_normal_(sub)
+                weight = sub.repeat_interleave(16, dim=0)
+                layer.weight.data.copy_(weight)
 
     def forward(self, elev, terra, mask=None):
         B, D = elev.shape[0], self.embed_dim

@@ -280,11 +280,10 @@ class MultiCountyDataset(Dataset):
 
         return elevation, top_rasters, base_rasters, alphaearth
 
-    def generate_indices(self):
+    def generate_indices(self, rng):
         if self._county_patches is None:
             self._build_patch_lists()
 
-        rng = np.random.default_rng()
         county_counts = rng.multinomial(self.count, self._county_weights).tolist()
 
         indices = []
@@ -321,13 +320,11 @@ class MultiCountyDataset(Dataset):
         weights = np.exp(log_sizes)
         self._county_weights = weights / weights.sum()
 
-    def split_test(self, count, frac=0.05, seed=42):
+    def split_test(self, count, rng, frac=0.05):
         print('Splitting data')
     
         if self._county_patches is None:
             self._build_patch_lists()
-
-        rng = np.random.default_rng(seed)
 
         test_patch_lists = []
         train_patch_lists = []
@@ -339,8 +336,6 @@ class MultiCountyDataset(Dataset):
 
             test_patch_lists.append([patches[i] for i in chosen_idx])
             train_patch_lists.append([p for i, p in enumerate(patches) if i not in chosen_set])
-
-        test_count = sum(len(p) for p in test_patch_lists)
 
         test_dataset = MultiCountyDataset(
             self.counties,
@@ -357,11 +352,9 @@ class MultiCountyDataset(Dataset):
 
         return test_dataset
 
-    def select_boreholes(self, top_rasters, base_rasters, count, seed=None, size=None):
+    def select_boreholes(self, top_rasters, base_rasters, count, rng, size=None):
         if size is None:
             size = self.size
-
-        rng = np.random.default_rng(seed)
 
         out = torch.zeros(len(top_rasters), count, 5, dtype=torch.float32)
 

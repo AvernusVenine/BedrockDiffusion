@@ -129,34 +129,60 @@ class BedrockTransformer(nn.Module):
         ###--- Elevation Skip Connection ---###
         self.elev_skip = nn.Sequential(
             nn.ReplicationPad2d(1),
-            nn.Conv2d(1, 64, kernel_size=3, padding=0),
-            nn.GroupNorm(8, 64),
+            nn.Conv2d(1, 32, kernel_size=3, padding=0),
+            nn.GroupNorm(8, 32),
             nn.SiLU(),
             nn.ReplicationPad2d(1),
-            nn.Conv2d(64, 64, kernel_size=3, padding=0),
+            nn.Conv2d(32, 64, kernel_size=3, padding=0),
             nn.GroupNorm(8, 64),
             nn.SiLU(),
         )
 
-        ###--- Bedrock Surface Elevation Head ---###
+        ###--- Bedrock Surface Elevation Upsampling Head---###
         self.elev_upsample = nn.Sequential(
-            nn.Upsample(scale_factor=patch_size, mode='bilinear', align_corners=False),
             nn.ReplicationPad2d(1),
-            nn.Conv2d(embed_dim, 1, kernel_size=3, padding=0)
+            nn.Conv2d(embed_dim, 256 * 4, kernel_size=3, padding=0),
+            nn.PixelShuffle(2),
+            nn.GroupNorm(8, 256),
+            nn.SiLU(),
+            nn.ReplicationPad2d(1),
+            nn.Conv2d(256, 128 * 4, kernel_size=3, padding=0),
+            nn.PixelShuffle(2),
+            nn.GroupNorm(8, 128),
+            nn.SiLU(),
+            nn.ReplicationPad2d(1),
+            nn.Conv2d(128, 64 * 4, kernel_size=3, padding=0),
+            nn.PixelShuffle(2),
+            nn.GroupNorm(8, 64),
+            nn.SiLU(),
+            nn.ReplicationPad2d(1),
+            nn.Conv2d(64, 32 * 4, kernel_size=3, padding=0),
+            nn.PixelShuffle(2),
+            nn.GroupNorm(8, 32),
+            nn.SiLU(),
         )
         self.elev_refine = nn.Sequential(
             nn.ReplicationPad2d(2),
-            nn.Conv2d(65, 32, kernel_size=5, padding=0),
-            nn.GroupNorm(8, 32),
+            nn.Conv2d(96, 64, kernel_size=5, padding=0),
+            nn.GroupNorm(8, 64),
             nn.SiLU(),
             nn.ReplicationPad2d(2),
-            nn.Conv2d(32, 32, kernel_size=5, padding=0),
+            nn.Conv2d(64, 32, kernel_size=5, padding=0),
             nn.GroupNorm(8, 32),
             nn.SiLU(),
             nn.ReplicationPad2d(1),
             nn.Conv2d(32, 1, kernel_size=3, padding=0)
         )
 
+        #- Initialize upscale weights to avoid checkerboard patterns -#
+        for layer in self.elev_upsample:
+            if isinstance(layer, nn.Conv2d):
+                weight = layer.weight.data
+                out_channels, in_channels, H, W = weight.shape
+                sub = torch.zeros(out_channels // 4, in_channels, H, W)
+                nn.init.kaiming_normal_(sub)
+                weight = sub.repeat_interleave(4, dim=0)
+                layer.weight.data.copy_(weight)
 
     def apply_mask(self, tokens, B, mask=None):
         if mask is None:
@@ -191,7 +217,7 @@ class BedrockTransformer(nn.Module):
 
         #- Extract encoded elevation and apply skip connection -#
         elev = encoder_input[:, :n_elev, :]
-        elev = elev.permute(0, 2, 1).reshape(B, self.embed_dim, self.raster_size // self.patch_size, self.raster_size // self.patch_size)
+        elev = elev.permute(0, 2, 1).reshape(B, self.embed_dim, H, W)
         elev = self.elev_upsample(elev)
 
         elev = torch.concatenate([elev, e_skip], dim=1)

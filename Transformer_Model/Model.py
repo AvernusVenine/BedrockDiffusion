@@ -27,10 +27,9 @@ class BoreholeScheduler:
     
         return int(self.rng.integers(current_min, current_max + 1))
 
-def augment_batch(elevation, top_rasters, base_rasters, alphaearth):
-
-    k = random.randint(0, 3)
-    flip = random.random() < 0.5
+def augment_batch(elevation, top_rasters, base_rasters, alphaearth, rng):
+    k = int(rng.integers(0, 3))
+    flip = rng.random() < 0.5
 
     elevation = torch.rot90(elevation, k=k, dims=(-2, -1))
     top_rasters = torch.rot90(top_rasters, k=k, dims=(-2, -1))
@@ -45,8 +44,9 @@ def augment_batch(elevation, top_rasters, base_rasters, alphaearth):
 
     return elevation, top_rasters, base_rasters, alphaearth
 
-def prepare_batch(elevation, top_rasters, base_rasters, alphaearth, dataset, bh_count, device):
-    elevation, top_rasters, base_rasters, alphaearth = augment_batch(elevation, top_rasters, base_rasters, alphaearth)
+def prepare_batch(elevation, top_rasters, base_rasters, alphaearth, dataset, bh_count, device, rng, augment=True):
+    if augment:
+        elevation, top_rasters, base_rasters, alphaearth = augment_batch(elevation, top_rasters, base_rasters, alphaearth, rng)
 
     B, F, _, H, W = elevation.shape
 
@@ -55,7 +55,7 @@ def prepare_batch(elevation, top_rasters, base_rasters, alphaearth, dataset, bh_
 
     B, F, _, H, W = top_rasters.shape
 
-    boreholes = [dataset.select_boreholes(top, base, count=bh_count) for top, base in zip(top_rasters, base_rasters)]
+    boreholes = [dataset.select_boreholes(top, base, count=bh_count, rng=rng) for top, base in zip(top_rasters, base_rasters)]
     boreholes = torch.stack(boreholes).reshape(B*F, bh_count, 5)
 
     top_rasters = top_rasters.reshape(B*F, 1, H, W)
@@ -72,17 +72,18 @@ def prepare_batch(elevation, top_rasters, base_rasters, alphaearth, dataset, bh_
 
     return elevation, top_rasters, existence, alphaearth, boreholes
 
-def test(data_path, model_path, save_path, count=20, total_size=None):
+def test(data_path, model_path, save_path, count=20, total_size=None, seed=0):
     model_dict = torch.load(f'{model_path}.mdl')
 
     raster_size = model_dict['raster_size']
     patch_size = model_dict['patch_size']
     embed_dim = model_dict['embed_dim']
-    encoder_depth = model_dict['encoder_depth']
-    decoder_depth = model_dict['decoder_depth']
+    encoder_depth = model_dict['depth']
     mlp_dim = model_dict['mlp_dim']
 
     print('Model loaded')
+
+    rng = np.random.default_rng(seed)
 
     formations = [
         'kwnd', 'dlp', 'dspl', 'omaq', 'odub', 'ogsv', 'ogpr', 'ogcm', 'odcr', 'opgw', 'ostp', 'opsh', 'opod',
@@ -94,7 +95,7 @@ def test(data_path, model_path, save_path, count=20, total_size=None):
     scaler_dict = {'elevation': joblib.load(f'{model_path}_elevation.scl')}
 
     dataset = Data.MultiCountyDataset(counties, scaler_dict, 1, total_size, 1.0)
-    dataset.generate_indices()
+    dataset.generate_indices(rng)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -105,11 +106,10 @@ def test(data_path, model_path, save_path, count=20, total_size=None):
         patch_size,
         embed_dim,
         num_heads=8,
-        encoder_depth=encoder_depth,
-        decoder_depth=decoder_depth,
+        depth=encoder_depth,
         mlp_dim=mlp_dim
     ).to(device)
-    model.load_state_dict(state, strict=False)
+    model.load_state_dict(state)
 
     model.eval()
 
@@ -121,7 +121,7 @@ def test(data_path, model_path, save_path, count=20, total_size=None):
     alphaearth = alphaearth.unsqueeze(0)
 
     elevation, top_rasters, base_rasters, alphaearth, boreholes = prepare_batch(
-        elevation, top_rasters, base_rasters, alphaearth, dataset, count, device
+        elevation, top_rasters, base_rasters, alphaearth, dataset, count, device, rng
     )
 
     B, C, H, W = top_rasters.shape
@@ -142,7 +142,7 @@ def test(data_path, model_path, save_path, count=20, total_size=None):
             b_tile = base_rasters[:, :, r0:r1, c0:c1].unsqueeze(1)
             ae_tile = alphaearth[:, :, r0:r1, c0:c1]
 
-            boreholes = [dataset.select_boreholes(top, base, count=count, size=raster_size) for top, base in zip(t_tile, b_tile)]
+            boreholes = [dataset.select_boreholes(top, base, count=count, size=raster_size, rng=rng) for top, base in zip(t_tile, b_tile)]
             boreholes = torch.stack(boreholes).reshape(B, count, 5)
             boreholes = boreholes.to(device, dtype=torch.float32)
 
@@ -186,13 +186,30 @@ def test(data_path, model_path, save_path, count=20, total_size=None):
 
         print(f' {formations[idx]}')
 
-def train(data_path, save_path, lr=1e-4, max_epochs=100):
-    raster_size = 128
-    patch_size = 16
-    embed_dim = 512
-    mlp_dim = 1024
+def train(data_path, save_path, lr=1e-4, max_epochs=100, seed=0, load=False):
+    if load:
+        model_dict = torch.load(f'{save_path}.mdl')
+
+        raster_size = model_dict['raster_size']
+        patch_size = model_dict['patch_size']
+        embed_dim = model_dict['embed_dim']
+        mlp_dim = model_dict['mlp_dim']
+        encoder_depth = model_dict['depth']
+    else:
+        model_dict = None
+
+        raster_size = 128
+        patch_size = 16
+        embed_dim = 512
+        mlp_dim = 1024
+        encoder_depth = 12
+
     data_count = 3000
-    encoder_depth = 10
+
+    bh_max = 200
+    bh_min = 20
+
+    rng = np.random.default_rng(seed)
 
     # =============================
     # DATA PREPROCESSING
@@ -207,12 +224,15 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
 
     counties = [Data.CountySource(p, formations) for p in data_path]
 
-    scaler_dict = Data.create_global_scaler_dict(counties)
+    if load:
+        scaler_dict = {'elevation': joblib.load(f'{save_path}_elevation.scl')}
+    else:
+        scaler_dict = Data.create_global_scaler_dict(counties)
 
-    print('Generating scalers')
+        print('Generating scalers')
 
-    for k, v in scaler_dict.items():
-        joblib.dump(v, f'{save_path}_{k}.scl')
+        for k, v in scaler_dict.items():
+            joblib.dump(v, f'{save_path}_{k}.scl')
 
     # =============================
     # DATASET CONSTRUCTION
@@ -220,21 +240,17 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
 
     dataset = Data.MultiCountyDataset(counties, scaler_dict, data_count, raster_size)
 
-    test_dataset = dataset.split_test(int(data_count * 0.1))
+    test_dataset = dataset.split_test(int(data_count * 0.1), rng)
     train_dataset = dataset
 
     train_loader = DataLoader(train_dataset, batch_size=8, num_workers=0)
     test_loader = DataLoader(test_dataset, batch_size=8, num_workers=0)
-
-    test_dataset.generate_indices()
 
     # =============================
     # MODEL CONSTRUCTION
     # =============================
 
     print('Constructing Model...')
-
-    bh_scheduler = BoreholeScheduler([50, 200], [1, 25], 50)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -246,20 +262,31 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
         depth=encoder_depth,
         mlp_dim=mlp_dim,
     ).to(device)
-    print(' constructed TERRA')
+    if load:
+        model.load_state_dict(model_dict['model'])
+
+    print('     constructed TERRA')
 
     optimizer = torch.optim.AdamW(
         list(model.parameters()),
         lr=lr,
         weight_decay=1e-4,
     )
+    if load:
+        optimizer.load_state_dict(model_dict['optimizer'])
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=10
     )
 
+    test_dataset.generate_indices(rng)
+
     patience = 0
     best_loss = np.inf
+
+    if load:
+        best_loss = float(model_dict['loss'])
+
     loss_dict = {'train': [], 'test': []}
 
     for epoch in range(max_epochs):
@@ -272,13 +299,13 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
         model.train()
 
         train_loss = 0.0
-        train_dataset.generate_indices()
+        train_dataset.generate_indices(rng)
 
         for elevation, top_rasters, base_rasters, alphaearth in train_loader:
-            count = bh_scheduler.sample(epoch)
+            count = int(rng.integers(bh_min, bh_max + 1))
 
             elevation, top_rasters, existence, alphaearth, boreholes = prepare_batch(
-                elevation, top_rasters, base_rasters, alphaearth, train_dataset, count, device)
+                elevation, top_rasters, base_rasters, alphaearth, train_dataset, count, device, rng)
 
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 predicted_elevation = model(elevation, boreholes, alphaearth)
@@ -303,11 +330,11 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
         test_loss = 0.0
 
         with torch.no_grad():
-            for elevation, top_rasters, base_rasters, alphaearth in test_loader:
-                count = bh_scheduler.sample(epoch)
+            for idx, (elevation, top_rasters, base_rasters, alphaearth) in enumerate(test_loader):
+                count = int(rng.integers(bh_min, bh_max + 1))
 
                 elevation, top_rasters, existence, alphaearth, boreholes = prepare_batch(
-                    elevation, top_rasters, base_rasters, alphaearth, train_dataset, count, device)
+                    elevation, top_rasters, base_rasters, alphaearth, train_dataset, count, device, rng, augment=False)
 
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                     predicted_elevation = model(elevation, boreholes, alphaearth)

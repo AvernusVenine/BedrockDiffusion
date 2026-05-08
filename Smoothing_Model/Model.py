@@ -9,10 +9,9 @@ from Transformer_Model.Transformer import BedrockTransformer
 from Smoothing_Model.Transformer import SmoothingTransformer
 import random
 
-def augment_batch(elevation, top_rasters, base_rasters, alphaearth):
-
-    k = random.randint(0, 3)
-    flip = random.random() < 0.5
+def augment_batch(elevation, top_rasters, base_rasters, alphaearth, rng):
+    k = int(rng.integers(0, 3))
+    flip = rng.random() < 0.5
 
     elevation = torch.rot90(elevation, k=k, dims=(-2, -1))
     top_rasters = torch.rot90(top_rasters, k=k, dims=(-2, -1))
@@ -28,8 +27,9 @@ def augment_batch(elevation, top_rasters, base_rasters, alphaearth):
     return elevation, top_rasters, base_rasters, alphaearth
 
 
-def prepare_batch(elevation, top_rasters, base_rasters, alphaearth, device):
-    elevation, top_rasters, base_rasters, alphaearth = augment_batch(elevation, top_rasters, base_rasters, alphaearth)
+def prepare_batch(elevation, top_rasters, base_rasters, alphaearth, device, rng, augment=True):
+    if augment:
+        elevation, top_rasters, base_rasters, alphaearth = augment_batch(elevation, top_rasters, base_rasters, alphaearth, rng)
 
     B, F, _, H, W = elevation.shape
 
@@ -44,8 +44,9 @@ def prepare_batch(elevation, top_rasters, base_rasters, alphaearth, device):
     elevation = elevation.to(device, dtype=torch.bfloat16)
     alphaearth = alphaearth.to(device, dtype=torch.bfloat16)
     top_rasters = top_rasters.to(device, dtype=torch.bfloat16)
+    base_rasters = base_rasters.to(device, dtype=torch.bfloat16)
 
-    return elevation, top_rasters, alphaearth
+    return elevation, top_rasters, base_rasters, alphaearth
 
 def terra_mask(N, B, device, alpha):
     beta = torch.distributions.Beta(torch.tensor(alpha), torch.tensor(alpha))
@@ -60,9 +61,11 @@ def terra_mask(N, B, device, alpha):
 
     return mask
 
-def train(data_path, save_path, lr=1e-4, max_epochs=100):
+def train(data_path, save_path, lr=1e-4, max_epochs=100, seed=0):
     data_count = 500
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    rng = np.random.default_rng(seed)
 
     # =============================
     # LOADING TERRA
@@ -98,7 +101,7 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
     # =============================
 
     max_size = 512
-    patch_size = 16
+    patch_size = 64
     embed_dim = 256
     mlp_dim = 512
     depth = 8
@@ -116,10 +119,8 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
 
     dataset = Data.MultiCountyDataset(counties, scaler_dict, data_count, max_size)
 
-    test_dataset = dataset.split_test(int(data_count * 0.1))
+    test_dataset = dataset.split_test(int(data_count * 0.1), rng)
     train_dataset = dataset
-
-    test_dataset.generate_indices()
 
     train_loader = DataLoader(train_dataset, batch_size=8, num_workers=0)
     test_loader = DataLoader(test_dataset, batch_size=8, num_workers=0)
@@ -145,6 +146,8 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
         optimizer, mode='min', factor=0.5, patience=10
     )
 
+    test_dataset.generate_indices(rng)
+
     patience = 0
 
     best_loss = np.inf
@@ -160,11 +163,11 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
         model.train()
 
         train_loss = 0.0
-        train_dataset.generate_indices()
+        train_dataset.generate_indices(seed)
 
         for elevation, top_rasters, base_rasters, alphaearth in train_loader:
-
-            elevation, top_rasters, alphaearth = prepare_batch(elevation, top_rasters, base_rasters, alphaearth, device)
+            num_f = top_rasters.shape[1]
+            elevation, top_rasters, base_rasters, alphaearth = prepare_batch(elevation, top_rasters, base_rasters, alphaearth, device, rng)
 
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
 
@@ -177,7 +180,7 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
 
                     for i in range(n):
                         for j in range(n):
-                            count = np.random.randint(1, 101)
+                            count = int(rng.integers(1, 101))
 
                             r0, r1 = i * raster_size, (i+1) * raster_size
                             c0, c1 = j * raster_size, (j+1) * raster_size
@@ -187,7 +190,11 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
                             b_tile = base_rasters[:, :, r0:r1, c0:c1]
                             ae_tile = alphaearth[:, :, r0:r1, c0:c1]
 
-                            boreholes = [train_dataset.select_boreholes(top, base, count=count, size=raster_size) for top, base in zip(t_tile, b_tile)]
+                            boreholes = [
+                                train_dataset.select_boreholes(top.reshape(B//num_f, num_f, C, H, W),
+                                base.reshape(B//num_f, num_f, C, H, W), count=count, size=raster_size, rng=rng) for
+                                top, base in zip(t_tile, b_tile)
+                            ]
                             boreholes = torch.stack(boreholes).reshape(B, count, 5)
                             boreholes = boreholes.to(device, dtype=torch.bfloat16)
 
@@ -236,8 +243,10 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
 
         with torch.no_grad():
             for elevation, top_rasters, base_rasters, alphaearth in test_loader:
-                elevation, top_rasters, alphaearth = prepare_batch(elevation, top_rasters, base_rasters, alphaearth,
-                                                                   device)
+                num_f = top_rasters.shape[1]
+
+                elevation, top_rasters, base_rasters, alphaearth = prepare_batch(elevation, top_rasters, base_rasters, alphaearth,
+                                                                   device, rng, augment=False)
 
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
 
@@ -249,7 +258,7 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
 
                     for i in range(n):
                         for j in range(n):
-                            count = np.random.randint(1, 101)
+                            count = int(rng.integers(1, 101))
 
                             r0, r1 = i * raster_size, (i + 1) * raster_size
                             c0, c1 = j * raster_size, (j + 1) * raster_size
@@ -259,8 +268,11 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
                             b_tile = base_rasters[:, :, r0:r1, c0:c1]
                             ae_tile = alphaearth[:, :, r0:r1, c0:c1]
 
-                            boreholes = [train_dataset.select_boreholes(top, base, count=count) for top, base in
-                                         zip(t_tile, b_tile)]
+                            boreholes = [
+                                train_dataset.select_boreholes(top.reshape(B//num_f, num_f, C, H, W),
+                                base.reshape(B//num_f, num_f, C, H, W), count=count, size=raster_size, rng=rng) for top,
+                                base in zip(t_tile, b_tile)
+                            ]
                             boreholes = torch.stack(boreholes).reshape(B, count, 5)
 
                             tile_pred = terra(elev_tile, boreholes, ae_tile)
@@ -277,8 +289,6 @@ def train(data_path, save_path, lr=1e-4, max_epochs=100):
                     terra_pred = terra_pred[:, :, r0:r0 + target_size, c0:c0 + target_size]
                     top_rasters = top_rasters[:, :, r0:r0 + target_size, c0:c0 + target_size]
                     elevation = elevation[:, :, r0:r0+target_size, c0:c0+target_size]
-
-
 
                     smoothed = model(elevation, terra_pred)
 
