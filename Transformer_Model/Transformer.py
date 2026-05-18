@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 class PatchEmbedding(nn.Module):
     def __init__(self, patch_size, in_channels, embed_dim):
@@ -95,12 +96,13 @@ class TransformerBlock(nn.Module):
 
 
 class BedrockTransformer(nn.Module):
-    def __init__(self, raster_size, patch_size, embed_dim, num_heads, depth, mlp_dim):
+    def __init__(self, raster_size, patch_size, embed_dim, num_heads, depth, mlp_dim, use_checkpoint=False):
         super().__init__()
 
         self.embed_dim = embed_dim
         self.raster_size = raster_size
         self.patch_size = patch_size
+        self.use_checkpoint = use_checkpoint
 
         ###--- Bedrock Queries ---###
         self.bedrock_query_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
@@ -213,7 +215,11 @@ class BedrockTransformer(nn.Module):
         encoder_input = torch.concatenate([elev, ae, bh], dim=1)
 
         for block in self.encoder_blocks:
-            encoder_input = block(encoder_input)
+
+            if self.use_checkpoint:
+                encoder_input = checkpoint(block, encoder_input, use_reentrant=False)
+            else:
+                encoder_input = block(encoder_input)
 
         #- Extract encoded elevation and apply skip connection -#
         elev = encoder_input[:, :n_elev, :]

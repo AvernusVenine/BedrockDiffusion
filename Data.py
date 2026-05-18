@@ -109,12 +109,13 @@ class PatchSampler(Sampler):
 
 
 class MultiCountyDataset(Dataset):
-    def __init__(self, counties, scaler_dict, count, raster_size, temperature=2.0):
+    def __init__(self, counties, scaler_dict, count, raster_size, temperature=2.0, max_f=4):
         self.counties = counties
         self.scaler_dict = scaler_dict
         self.count = count
         self.size = raster_size
         self.temperature = temperature
+        self.max_f = max_f
 
         self._county_patches = None
         self._county_weights = None
@@ -256,22 +257,25 @@ class MultiCountyDataset(Dataset):
             .repeat(top_rasters.shape[0], 1, 1, 1)
         )
 
-        ###--- Keep shallowest 3 and one random deeper formation ---###
+        ###--- Keep shallowest 3 and (3-max_f) random deeper formation(s) ---###
         if len(top_rasters) > 3:
             rng = np.random.default_rng()
-            rand_idx = rng.integers(3, len(top_rasters))
-            sel = [0, 1, 2, rand_idx]
+
+            pool = np.arange(3, len(top_rasters))
+            n_extra = min(self.max_f - 3, len(pool))
+
+            rand_idx = rng.choice(pool, size=n_extra, replace=False)
+            sel = np.concatenate([[0, 1, 2], rand_idx])
 
             top_rasters = top_rasters[sel]
             base_rasters = base_rasters[sel]
             elevation = elevation[sel]
             alphaearth = alphaearth[sel]
 
-        max_f = 4
         f = top_rasters.shape[0]
 
-        if f < max_f:
-            pad = max_f - f
+        if f < self.max_f:
+            pad = self.max_f - f
 
             top_rasters = torch.cat([top_rasters, top_rasters[-1:].expand(pad, -1, -1, -1)], dim=0)
             base_rasters = torch.cat([base_rasters, base_rasters[-1:].expand(pad, -1, -1, -1)], dim=0)
